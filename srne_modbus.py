@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-srne_modbus.py v1.3.0 - SRNE Invertor Modbus RTU -> MQTT -> Home Assistant
+srne_modbus.py v1.3.1 - SRNE Invertor Modbus RTU -> MQTT -> Home Assistant
 ===========================================================================
 Dispozitiv: Easun ISI Max II 3.6kW/24V = SRNE HF2450S80H
 Interfata:  Port USB-B (mufa patrata) -> CH340 -> /dev/ttyUSB*
@@ -10,32 +10,38 @@ Registri confirmati pe firmware HF2450S80H:
   0x0100 x 15: SOC, Vbat, Ibat(signed), Vpv string, Ipv, Ppv, charge step
   0x0204 x 31: machine state, RTC, AC output, load ratio, temperaturi
   0xF02F x 13: energie PV azi/total, consum azi/total
-  0xE004 x 1:  machine state
+  0xE004 x 1:  machine state (mai detaliat decat 0x0209)
   0xE204 x 1:  fault/alarm
+  0xE20F x 1:  output priority (confirmat: 3=Solar only/Off-grid)
 
-Registri experimentali (cititi la startup + 1/zi, sarit daca exception):
-  0xE20F x 1:  output priority (0=utility, 1=solar, 2=SBU) — de confirmat
-  0xE000 x 8:  model info (rated power, voltages, currents) — de confirmat
-  0xE010 x 2:  firmware versions (app, bootloader) — de confirmat
+Bloc 0xE000-0xE012 (confirmat empiric pe HF2450S80H):
+  E001 = 50   -> x10 = 500V  Vpv max string
+  E002 = 100  -> x1  = 100A  I max incarcare total (PV + retea)
+  E003 = 24   -> x1  =  24V  tensiune nominala baterie
+  E005-E00E   -> 10 valori curba (Peukert/SOC lookup) - nume TBD utilizator
+  E012 = 365  -> x10 = 3650W = 3.6kW putere nominala
+  E010/E011   -> nu contin versiunile firmware APP/Boot
+
+Bloc 0xF000-0xF00F (confirmat empiric pe HF2450S80H):
+  16 valori x0.1 kWh = istoricul productiei PV ultimele 16 zile
+  F000 = azi (confirmat: 32=3.2kWh=PV azi), F001=ieri, ..., F00F=ziua-15
 
 HA Energy Dashboard:
   pv_energy_total_kwh + load_energy_total_kwh (total_increasing)
-  HA calculeaza zilnic/saptamanal/lunar automat din diferente cumulative.
 
 Changelog:
-  v1.3.0 - RTC sync inteligent: drift check la 00:05, sync daca drift > 60s
-           evita resetul contorilor zilnici (sync era la ore aiurea)
-           adaugat output_priority (0xE20F experimental)
-           adaugat citire model info + SW versions (0xE000, 0xE010 experimental)
-           battery_charge_step: enum extins cu "Const current/voltage"
-           slow_poll (3600s) pentru registri configurabili (output_priority)
-  v1.2.0 - eliminat temp_controller/temp_battery (0 pe HF2450S80H)
-           eliminat rtc_datetime din senzori HA
-           suggested_display_precision pentru tensiuni/curenti
-           daily energy = state_class measurement
-  v1.1.0 - recv_slave_frame() cu filtrare dupa adresa slave (fix CRC errors)
-           citire 0x0100 x 15 (fix exception 0x0A la 35 regs)
-           Ibat signed int16, logging dual consola+fisier
+  v1.3.1 - fix OUTPUT_PRIORITY: adaugat 3=Solar only/Off-grid (confirmat empiric)
+           fix model info: E001=Vpv_max(x10), E002=Ichg_max, E003=Vnom_bat
+           adaugat E012=putere nominala (365x10=3650W=3.6kW)
+           citire E000 x 19 (acopera E000-E012 intr-o cerere)
+           adaugat E005-E00E: curba Peukert/SOC (10 valori, logat+publicat ca lista)
+           adaugat F000-F00F: istoricul PV 16 zile (logat + in JSON state)
+           eliminat fw_app/boot_version (E010/E011 nu contin versiunile)
+           senzori HA noi: model_rated_power_w, model_pv_max_voltage_v,
+             model_max_chg_current_a, model_bat_nominal_v
+  v1.3.0 - RTC smart sync la 00:05, drift check, output_priority, slow poll
+  v1.2.0 - eliminat temp_controller/temp_battery, precision display
+  v1.1.0 - recv_slave_frame filtrare bus, 0x0100x15, Ibat signed, log fisier
   v1.0.0 - versiune initiala
 
 Autor: Smart-LK / Claude Sonnet, mai 2026
@@ -52,7 +58,7 @@ from datetime import datetime, date
 import paho.mqtt.client as mqtt
 import serial
 
-# ─── Config ───────────────────────────────────────────────────────────────────
+# --- Config -------------------------------------------------------------------
 
 DEFAULTS = {
     "serial_port":         "/dev/ttyUSB1",
@@ -78,7 +84,7 @@ def load_config() -> dict:
             print(f"[WARN] options.json: {e}")
     return cfg
 
-# ─── Logging dual: consola + fisier ───────────────────────────────────────────
+# --- Logging dual: consola + fisier -------------------------------------------
 
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "srne_modbus.log")
 
@@ -98,7 +104,7 @@ def setup_logging(level_str: str):
     except Exception as e:
         logging.warning(f"Nu pot deschide log file {LOG_FILE}: {e}")
 
-# ─── CRC16 Modbus ─────────────────────────────────────────────────────────────
+# --- CRC16 Modbus -------------------------------------------------------------
 
 def _crc16(data: bytes) -> int:
     crc = 0xFFFF
@@ -127,16 +133,11 @@ def _build_fc16(addr, reg_start, values):
     return pdu + struct.pack("<H", _crc16(pdu))
 
 def _to_signed16(val: int) -> int:
-    """uint16 → int16 cu semn. Ibat: negativ=incarcare, pozitiv=descarcare."""
     return val if val < 0x8000 else val - 0x10000
 
-# ─── Receive cu filtrare dupa adresa slave ────────────────────────────────────
+# --- Receive cu filtrare dupa adresa slave ------------------------------------
 
 def _recv_slave_frame(ser, slave_addr: int, expected_regs: int, timeout=3.0):
-    """
-    Citeste bytes de pe bus si cauta un frame Modbus valid pentru slave_addr.
-    Bytes cu alta adresa sunt ignorati (trafic intern invertor->BMS etc.).
-    """
     buf = bytearray()
     start = time.time()
     ignored = 0
@@ -152,10 +153,7 @@ def _recv_slave_frame(ser, slave_addr: int, expected_regs: int, timeout=3.0):
                 ignored += 1
                 i += 1
                 continue
-
             rest = buf[i:]
-
-            # Frame normal FC03
             if len(rest) >= 3 and rest[1] == 0x03:
                 byte_count = rest[2]
                 if byte_count != expected_regs * 2:
@@ -171,8 +169,6 @@ def _recv_slave_frame(ser, slave_addr: int, expected_regs: int, timeout=3.0):
                     return frame, False
                 i += 1
                 continue
-
-            # Frame exception FC03 (0x83)
             if len(rest) >= 5 and rest[1] == 0x83:
                 frame = bytes(rest[:5])
                 if struct.unpack("<H", frame[-2:])[0] == _crc16(frame[:-2]):
@@ -181,14 +177,13 @@ def _recv_slave_frame(ser, slave_addr: int, expected_regs: int, timeout=3.0):
                     return frame, True
                 i += 1
                 continue
-
             i += 1
 
     if ignored > 0:
         logging.debug(f"Bus: ignorat {ignored}b (timeout)")
     return None, False
 
-# ─── Modbus RTU ───────────────────────────────────────────────────────────────
+# --- Modbus RTU ---------------------------------------------------------------
 
 class ModbusRTU:
     def __init__(self, port, baudrate=9600, device_addr=1):
@@ -200,9 +195,7 @@ class ModbusRTU:
     def connect(self):
         self._ser = serial.Serial(
             self.port, self._baudrate,
-            bytesize=8, parity=serial.PARITY_NONE, stopbits=1,
-            timeout=0.1
-        )
+            bytesize=8, parity=serial.PARITY_NONE, stopbits=1, timeout=0.1)
         logging.info(f"Serial OK: {self.port} @ {self._baudrate} bps")
 
     def disconnect(self):
@@ -244,40 +237,28 @@ class ModbusRTU:
         return False
 
     def read_rtc(self) -> datetime | None:
-        """Citeste RTC-ul invertorului si returneaza un obiect datetime."""
         regs = self.read_registers(0x020C, 3)
         if regs is None:
             return None
         try:
             r0, r1, r2 = regs
-            year  = (r0 >> 8) + 2002
-            month = r0 & 0xFF
-            day   = r1 >> 8
-            hour  = r1 & 0xFF
-            minute= r2 >> 8
-            second= r2 & 0xFF
-            return datetime(year, month, day, hour, minute, second)
+            return datetime((r0 >> 8) + 2002, r0 & 0xFF,
+                            r1 >> 8, r1 & 0xFF, r2 >> 8, r2 & 0xFF)
         except Exception as e:
             logging.warning(f"RTC parse eroare: {e}")
             return None
 
     def sync_rtc(self) -> bool:
-        """Scrie ora sistemului in RTC-ul invertorului."""
         now = datetime.now()
         yy  = now.year - 2002
         values = [(yy << 8) | now.month,
                   (now.day << 8) | now.hour,
                   (now.minute << 8) | now.second]
         ok = self.write_registers(0x020C, values)
-        logging.info(f"RTC sync: {'OK' if ok else 'FAIL'} → {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        logging.info(f"RTC sync: {'OK' if ok else 'FAIL'} -> {now.strftime('%Y-%m-%d %H:%M:%S')}")
         return ok
 
     def check_and_sync_rtc(self, drift_threshold_s: int = 60) -> bool:
-        """
-        Citeste RTC-ul invertorului, calculeaza drift-ul fata de ora sistemului.
-        Sincronizeaza DOAR daca drift > drift_threshold_s.
-        Apelat o data pe zi la 00:05 — evita resetul contorilor zilnici.
-        """
         invertor_time = self.read_rtc()
         now = datetime.now()
         if invertor_time is None:
@@ -287,13 +268,13 @@ class ModbusRTU:
         logging.info(f"RTC check: invertor={invertor_time.strftime('%H:%M:%S')} "
                      f"sistem={now.strftime('%H:%M:%S')} drift={drift_s:.0f}s")
         if drift_s > drift_threshold_s:
-            logging.info(f"RTC drift {drift_s:.0f}s > {drift_threshold_s}s — sincronizare...")
+            logging.info(f"RTC drift {drift_s:.0f}s > {drift_threshold_s}s -- sincronizare...")
             return self.sync_rtc()
         else:
-            logging.info(f"RTC drift {drift_s:.0f}s in limite — fara sync")
+            logging.info(f"RTC drift {drift_s:.0f}s in limite -- fara sync")
             return False
 
-# ─── Parsare registri ─────────────────────────────────────────────────────────
+# --- Parsare registri ---------------------------------------------------------
 
 MACHINE_STATE = {
     0: "Standby", 1: "No anomaly", 2: "SW startup", 3: "Starting",
@@ -301,66 +282,47 @@ MACHINE_STATE = {
     7: "Fault", 8: "Shutdown", 9: "Running (inverter)"
 }
 
-# Charge step (0x010C) — confirmat pe HF2450S80H
-# "Const current" = Bulk/CC, "Const voltage" = Absorption/CV
 CHARGE_STEP = {
-    0: "Off",
-    1: "Const current",    # Bulk / CC phase
-    2: "MPPT",
-    3: "Equalize",
-    4: "Boost",
-    5: "Float",
-    6: "Current limit",
-    7: "Const voltage",    # Absorption / CV phase
+    0: "Off", 1: "Const current", 2: "MPPT", 3: "Equalize",
+    4: "Boost", 5: "Float", 6: "Current limit", 7: "Const voltage",
 }
 
+# Confirmat empiric: 3 = Solar only / Off-grid
 OUTPUT_PRIORITY = {
-    0: "Utility first",
-    1: "Solar first",
-    2: "SBU priority",
+    0: "Utility first", 1: "Solar first", 2: "SBU priority",
+    3: "Solar only / Off-grid",
 }
 
 
 def parse_0100(regs: list) -> dict:
-    """
-    Bloc 0x0100 x 15 regs.
-    Ibat signed: negativ=incarcare, pozitiv=descarcare.
-    0x0103 (temps) = 0 pe HF2450S80H — ignorat.
-    """
     def r(a):
         i = a - 0x0100
         return regs[i] if 0 <= i < len(regs) else 0
-
     cs   = r(0x010C) & 0xFF
     ibat = _to_signed16(r(0x0102))
-
     return {
-        "battery_soc":          r(0x0100) & 0xFF,
-        "battery_voltage":      round(r(0x0101) * 0.1, 1),
-        "battery_current":      round(ibat * 0.1, 1),
-        "pv_voltage":           round(r(0x0107) * 0.1, 1),
-        "pv_current":           round(r(0x0108) * 0.01, 2),
-        "pv_power":             r(0x0109),
-        "battery_charge_step":  CHARGE_STEP.get(cs, f"?({cs})"),
+        "battery_soc":         r(0x0100) & 0xFF,
+        "battery_voltage":     round(r(0x0101) * 0.1, 1),
+        "battery_current":     round(ibat * 0.1, 1),
+        "pv_voltage":          round(r(0x0107) * 0.1, 1),
+        "pv_current":          round(r(0x0108) * 0.01, 2),
+        "pv_power":            r(0x0109),
+        "battery_charge_step": CHARGE_STEP.get(cs, f"?({cs})"),
     }
 
 
 def parse_0204(regs: list) -> dict:
-    """Bloc 0x0204 x 31 regs — AC output, RTC, temperaturi invertor."""
     def r(a):
         i = a - 0x0204
         return regs[i] if 0 <= i < len(regs) else 0
-
     ms  = r(0x0209) & 0xFF
     r0, r1, r2 = r(0x020C), r(0x020D), r(0x020E)
     pac = r(0x021B)
     pap = r(0x021C)
-
     try:
         rtc = f"{(r0>>8)+2002:04d}-{r0&0xFF:02d}-{r1>>8:02d}T{r1&0xFF:02d}:{r2>>8:02d}:{r2&0xFF:02d}"
     except Exception:
         rtc = "invalid"
-
     return {
         "machine_state_code":  ms,
         "machine_state":       MACHINE_STATE.get(ms, f"?({ms})"),
@@ -380,15 +342,9 @@ def parse_0204(regs: list) -> dict:
 
 
 def parse_F02F(regs: list) -> dict:
-    """
-    Bloc 0xF02F x 13 regs.
-    _today: reseteaza la miezul noptii conform RTC invertor (afisare only).
-    _total: cumulativ total_increasing (pentru HA Energy Dashboard).
-    """
     def r(a):
         i = a - 0xF02F
         return regs[i] if 0 <= i < len(regs) else 0
-
     return {
         "pv_energy_today_kwh":   round(r(0xF02F) * 0.1, 1),
         "load_energy_today_kwh": round(r(0xF030) * 0.1, 1),
@@ -397,19 +353,48 @@ def parse_F02F(regs: list) -> dict:
     }
 
 
-def read_slow_registers(mb: ModbusRTU, state_cache: dict) -> dict:
+def parse_E000_block(regs: list) -> dict:
     """
-    Registri cititi rar (o data pe ora): output_priority + model info.
-    Registri experimentali — sarita daca returneaza exception.
-    Rezultatele sunt pastrate in cache intre citiri.
+    Bloc E000 x 19 regs (E000-E012).
+    E001: x10 = 500V Vpv max
+    E002: x1  = 100A I max incarcare total
+    E003: x1  = 24V  tensiune nominala baterie
+    E005-E00E: 10 valori curba Peukert/SOC (nume TBD de utilizator)
+    E012: x10 = 3650W = 3.6kW putere nominala
+    """
+    def r(i): return regs[i] if i < len(regs) else 0
+    peukert = [r(i) for i in range(5, 15)]  # E005-E00E (offset 5..14 din E000)
+    return {
+        "model_pv_max_voltage_v":  r(1) * 10,    # E001
+        "model_max_chg_current_a": r(2),          # E002
+        "model_bat_nominal_v":     r(3),          # E003
+        "model_rated_power_w":     r(18) * 10,   # E012 (offset 18 = 0x12)
+        "peukert_curve":           peukert,       # E005-E00E, 10 valori, nume TBD
+    }
+
+
+def parse_F000_block(regs: list) -> dict:
+    """
+    Bloc F000 x 16 regs = istoricul productiei PV ultimele 16 zile.
+    F000=azi (confirmat: 32=3.2kWh), F001=ieri, ..., F00F=ziua-15.
+    Scale: x0.1 kWh.
+    In JSON state ca pv_hist_day_0..15.
     """
     result = {}
+    for i, v in enumerate(regs[:16]):
+        result[f"pv_hist_day_{i}"] = round(v * 0.1, 1)
+    return result
 
-    # Output priority (0xE20F) — experimental, de confirmat pe HF2450S80H
+
+def read_slow_registers(mb: ModbusRTU, state_cache: dict) -> dict:
+    """Registri cititi o data pe ora. Sarite silentios daca returneaza exception."""
+    result = {}
+
+    # Output priority (0xE20F)
     try:
         r = mb.read_registers(0xE20F, 1)
         if r is not None:
-            op = r[0] & 0xFF
+            op  = r[0] & 0xFF
             val = OUTPUT_PRIORITY.get(op, f"?({op})")
             result["output_priority"] = val
             if state_cache.get("output_priority") != val:
@@ -422,52 +407,59 @@ def read_slow_registers(mb: ModbusRTU, state_cache: dict) -> dict:
         if "output_priority" in state_cache:
             result["output_priority"] = state_cache["output_priority"]
 
-    # Model info (0xE000 x 8) — experimental, de confirmat pe HF2450S80H
-    # Posibil: E000=rated VA, E001=rated chg A, E002=rated V bat, E003=rated A out
-    #          E004=machine state (deja avem), E005-E007=?
+    # Model info + curba Peukert: E000 x 19 (E000-E012)
+    model_keys = ("model_rated_power_w", "model_pv_max_voltage_v",
+                  "model_max_chg_current_a", "model_bat_nominal_v", "peukert_curve")
     try:
-        r = mb.read_registers(0xE000, 4)
+        r = mb.read_registers(0xE000, 19)
         if r is not None:
-            result["model_rated_va"]      = r[0]
-            result["model_rated_chg_a"]   = r[1]
-            result["model_rated_bat_v"]   = round(r[2] * 0.1, 1) if r[2] > 0 else r[2]
-            result["model_rated_out_a"]   = r[3]
-            if "model_rated_va" not in state_cache:
-                logging.info(f"Model info: {r[0]}VA chg={r[1]}A bat={r[2]}raw out={r[3]}A")
-            state_cache["model_rated_va"] = r[0]
-        elif "model_rated_va" in state_cache:
-            result["model_rated_va"]    = state_cache.get("model_rated_va")
-            result["model_rated_chg_a"] = state_cache.get("model_rated_chg_a")
+            parsed = parse_E000_block(r)
+            result.update(parsed)
+            if "model_rated_power_w" not in state_cache:
+                logging.info(
+                    f"Model: Pnom={parsed['model_rated_power_w']}W "
+                    f"Vpv_max={parsed['model_pv_max_voltage_v']}V "
+                    f"Ichg_max={parsed['model_max_chg_current_a']}A "
+                    f"Vbat_nom={parsed['model_bat_nominal_v']}V"
+                )
+                logging.info(f"Peukert/SOC curve E005-E00E: {parsed['peukert_curve']}")
+            state_cache.update(parsed)
+        else:
+            for k in model_keys:
+                if k in state_cache:
+                    result[k] = state_cache[k]
         time.sleep(0.15)
     except Exception:
-        pass
+        for k in model_keys:
+            if k in state_cache:
+                result[k] = state_cache[k]
 
-    # SW versions (0xE010 x 2) — experimental, de confirmat pe HF2450S80H
-    # Posibil: E010=APP version x100 (664=6.64), E011=Boot version x100 (201=2.01)
+    # Istoricul PV 16 zile: F000 x 16
+    hist_keys = [f"pv_hist_day_{i}" for i in range(16)]
     try:
-        r = mb.read_registers(0xE010, 2)
+        r = mb.read_registers(0xF000, 16)
         if r is not None:
-            result["fw_app_version"]  = round(r[0] / 100, 2) if r[0] > 0 else r[0]
-            result["fw_boot_version"] = round(r[1] / 100, 2) if r[1] > 0 else r[1]
-            if "fw_app_version" not in state_cache:
-                logging.info(f"Firmware: APP={r[0]} Boot={r[1]} (raw)")
-            state_cache["fw_app_version"]  = result["fw_app_version"]
-            state_cache["fw_boot_version"] = result["fw_boot_version"]
-        elif "fw_app_version" in state_cache:
-            result["fw_app_version"]  = state_cache["fw_app_version"]
-            result["fw_boot_version"] = state_cache["fw_boot_version"]
+            hist = parse_F000_block(r)
+            result.update(hist)
+            if "pv_hist_day_0" not in state_cache:
+                logging.info(f"Istoric PV 16 zile (kWh): {[round(v*0.1,1) for v in r]}")
+            state_cache.update(hist)
+        else:
+            for k in hist_keys:
+                if k in state_cache:
+                    result[k] = state_cache[k]
         time.sleep(0.15)
     except Exception:
-        pass
+        for k in hist_keys:
+            if k in state_cache:
+                result[k] = state_cache[k]
 
     return result
 
 
 def read_all(mb: ModbusRTU) -> dict | None:
-    """Citeste toti registrii de polling rapid. Returneaza None la eroare critica."""
     result = {"timestamp": datetime.now().isoformat()}
 
-    # Bloc 0x0100 x 15 — critica, fara ea returnam None
     r0100 = mb.read_registers(0x0100, 15)
     if r0100 is None:
         return None
@@ -498,57 +490,52 @@ def read_all(mb: ModbusRTU) -> dict | None:
 
     return result
 
-# ─── MQTT + HA Auto-Discovery ─────────────────────────────────────────────────
-#
-# (key, unit, device_class, name, icon, entity_category, precision)
-# Eliminat vs v1.2.0: charge_state → battery_charge_step (redenumit + enum extins)
-# Adaugat: output_priority, fw_app_version, fw_boot_version (experimental)
-#
+# --- MQTT + HA Auto-Discovery -------------------------------------------------
 
 SENSORS = [
-    # Baterie
-    ("battery_soc",          "%",   "battery",      "SOC Baterie",          "mdi:battery",            None,        0),
-    ("battery_voltage",      "V",   "voltage",      "Tensiune Baterie",     "mdi:battery-charging",   None,        1),
-    ("battery_current",      "A",   "current",      "Curent Baterie",       "mdi:current-dc",         None,        1),
-    # PV
-    ("pv_voltage",           "V",   "voltage",      "Tensiune PV",          "mdi:solar-panel",        None,        1),
-    ("pv_current",           "A",   "current",      "Curent PV",            "mdi:solar-panel",        None,        2),
-    ("pv_power",             "W",   "power",        "Putere PV",            "mdi:solar-power",        None,        0),
-    ("pv_energy_today_kwh",  "kWh", "energy",       "Energie PV Azi",       "mdi:solar-power",        None,        1),
-    ("pv_energy_total_kwh",  "kWh", "energy",       "Energie PV Total",     "mdi:solar-power",        None,        1),
-    # AC output
-    ("ac_output_voltage",    "V",   "voltage",      "Tensiune AC Out",      "mdi:power-plug",         None,        1),
-    ("ac_output_frequency",  "Hz",  "frequency",    "Frecventa AC Out",     "mdi:sine-wave",          None,        2),
-    ("ac_output_current",    "A",   "current",      "Curent AC Out",        "mdi:current-ac",         None,        1),
-    ("ac_active_power",      "W",   "power",        "Putere Activa AC",     "mdi:lightning-bolt",     None,        0),
-    ("ac_apparent_power",    "VA",  None,           "Putere Aparenta AC",   "mdi:lightning-bolt",     None,        0),
-    ("power_factor",         None,  "power_factor", "Factor Putere",        "mdi:angle-acute",        None,        3),
-    ("load_ratio",           "%",   None,           "Sarcina %",            "mdi:gauge",              None,        0),
-    ("load_energy_today_kwh","kWh", "energy",       "Consum Sarcina Azi",   "mdi:home-lightning-bolt",None,        1),
-    ("load_energy_total_kwh","kWh", "energy",       "Consum Sarcina Total", "mdi:home-lightning-bolt",None,        1),
-    # Temperaturi
-    ("temp_dc_side",         "°C",  "temperature",  "Temp DC Side",         "mdi:thermometer",        "diagnostic",1),
-    ("temp_ac_side",         "°C",  "temperature",  "Temp AC Side",         "mdi:thermometer",        "diagnostic",1),
-    ("temp_transformer",     "°C",  "temperature",  "Temp Trafo",           "mdi:thermometer",        "diagnostic",1),
-    # Stare
-    ("battery_charge_step",  None,  None,           "Etapa Incarcare",      "mdi:battery-charging",   "diagnostic",None),
-    ("machine_state",        None,  None,           "Stare Invertor",       "mdi:information",        "diagnostic",None),
-    ("output_priority",      None,  None,           "Prioritate Iesire",    "mdi:priority-high",      "diagnostic",None),
-    ("e204_fault",           None,  None,           "Cod Fault",            "mdi:alert",              "diagnostic",None),
-    # Firmware (experimental — apar doar daca registrii exista pe firmware)
-    ("fw_app_version",       None,  None,           "Firmware APP",         "mdi:chip",               "diagnostic",None),
-    ("fw_boot_version",      None,  None,           "Firmware Boot",        "mdi:chip",               "diagnostic",None),
+    # key                       unit   dc              name                       icon                      ent_cat      prec
+    ("battery_soc",            "%",   "battery",      "SOC Baterie",             "mdi:battery",            None,        0),
+    ("battery_voltage",        "V",   "voltage",      "Tensiune Baterie",        "mdi:battery-charging",   None,        1),
+    ("battery_current",        "A",   "current",      "Curent Baterie",          "mdi:current-dc",         None,        1),
+    ("pv_voltage",             "V",   "voltage",      "Tensiune PV",             "mdi:solar-panel",        None,        1),
+    ("pv_current",             "A",   "current",      "Curent PV",               "mdi:solar-panel",        None,        2),
+    ("pv_power",               "W",   "power",        "Putere PV",               "mdi:solar-power",        None,        0),
+    ("pv_energy_today_kwh",    "kWh", "energy",       "Energie PV Azi",          "mdi:solar-power",        None,        1),
+    ("pv_energy_total_kwh",    "kWh", "energy",       "Energie PV Total",        "mdi:solar-power",        None,        1),
+    ("ac_output_voltage",      "V",   "voltage",      "Tensiune AC Out",         "mdi:power-plug",         None,        1),
+    ("ac_output_frequency",    "Hz",  "frequency",    "Frecventa AC Out",        "mdi:sine-wave",          None,        2),
+    ("ac_output_current",      "A",   "current",      "Curent AC Out",           "mdi:current-ac",         None,        1),
+    ("ac_active_power",        "W",   "power",        "Putere Activa AC",        "mdi:lightning-bolt",     None,        0),
+    ("ac_apparent_power",      "VA",  None,           "Putere Aparenta AC",      "mdi:lightning-bolt",     None,        0),
+    ("power_factor",           None,  "power_factor", "Factor Putere",           "mdi:angle-acute",        None,        3),
+    ("load_ratio",             "%",   None,           "Sarcina %",               "mdi:gauge",              None,        0),
+    ("load_energy_today_kwh",  "kWh", "energy",       "Consum Sarcina Azi",      "mdi:home-lightning-bolt",None,        1),
+    ("load_energy_total_kwh",  "kWh", "energy",       "Consum Sarcina Total",    "mdi:home-lightning-bolt",None,        1),
+    ("temp_dc_side",           "°C",  "temperature",  "Temp DC Side",            "mdi:thermometer",        "diagnostic",1),
+    ("temp_ac_side",           "°C",  "temperature",  "Temp AC Side",            "mdi:thermometer",        "diagnostic",1),
+    ("temp_transformer",       "°C",  "temperature",  "Temp Trafo",              "mdi:thermometer",        "diagnostic",1),
+    ("battery_charge_step",    None,  None,           "Etapa Incarcare",         "mdi:battery-charging",   "diagnostic",None),
+    ("machine_state",          None,  None,           "Stare Invertor",          "mdi:information",        "diagnostic",None),
+    ("output_priority",        None,  None,           "Prioritate Iesire",       "mdi:priority-high",      "diagnostic",None),
+    ("e204_fault",             None,  None,           "Cod Fault",               "mdi:alert",              "diagnostic",None),
+    # Parametri model (statici, cititi 1/ora)
+    ("model_rated_power_w",    "W",   None,           "Putere Nominala",         "mdi:flash",              "diagnostic",0),
+    ("model_pv_max_voltage_v", "V",   None,           "Vpv Max String",          "mdi:solar-panel-large",  "diagnostic",0),
+    ("model_max_chg_current_a","A",   None,           "I Max Incarcare Total",   "mdi:current-dc",         "diagnostic",0),
+    ("model_bat_nominal_v",    "V",   None,           "Tensiune Nominala Bat",   "mdi:battery",            "diagnostic",0),
 ]
 
-TOTAL_INCREASING_KEYS  = {"pv_energy_total_kwh", "load_energy_total_kwh"}
-MEASUREMENT_ENERGY_KEYS= {"pv_energy_today_kwh", "load_energy_today_kwh"}
+TOTAL_INCREASING_KEYS   = {"pv_energy_total_kwh", "load_energy_total_kwh"}
+MEASUREMENT_ENERGY_KEYS = {"pv_energy_today_kwh", "load_energy_today_kwh"}
+NO_STATE_CLASS_KEYS     = {"model_rated_power_w", "model_pv_max_voltage_v",
+                           "model_max_chg_current_a", "model_bat_nominal_v"}
 
 DEVICE = {
     "identifiers":  ["srne_hf2450s80h"],
     "name":         "SRNE Invertor HF2450S80H",
     "model":        "HF2450S80H (Easun ISI Max II 3.6kW/24V)",
     "manufacturer": "SRNE Solar",
-    "sw_version":   "Modbus RTU v1.3.0",
+    "sw_version":   "Modbus RTU v1.3.1",
 }
 
 
@@ -575,7 +562,7 @@ def publish_discovery(client, cfg: dict):
             p["state_class"] = "total_increasing"
         elif key in MEASUREMENT_ENERGY_KEYS:
             p["state_class"] = "measurement"
-        elif unit in ("W", "VA", "V", "A", "%", "Hz", "°C"):
+        elif key not in NO_STATE_CLASS_KEYS and unit in ("W","VA","V","A","%","Hz","°C"):
             p["state_class"] = "measurement"
 
         client.publish(f"{prefix}/sensor/srne_{key}/config",
@@ -595,29 +582,32 @@ def publish_discovery(client, cfg: dict):
 
 
 def publish_state(client, topic_prefix: str, data: dict):
+    out = dict(data)
+    # Serializam lista peukert_curve ca string JSON pentru compatibilitate MQTT
+    if "peukert_curve" in out and isinstance(out["peukert_curve"], list):
+        out["peukert_curve"] = json.dumps(out["peukert_curve"])
     client.publish(f"{topic_prefix}/state",
-                   json.dumps(data, default=str), retain=False)
+                   json.dumps(out, default=str), retain=False)
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# --- Main ---------------------------------------------------------------------
 
-SLOW_POLL_INTERVAL = 3600   # 1 ora pentru registri configurabili
-RTC_CHECK_HOUR     = 0      # ora la care se verifica RTC (00:xx)
-RTC_CHECK_MINUTE   = 5      # minutul: 00:05
-RTC_DRIFT_THRESH   = 60     # drift maxim acceptat in secunde
+SLOW_POLL_INTERVAL = 3600
+RTC_CHECK_HOUR     = 0
+RTC_CHECK_MINUTE   = 5
+RTC_DRIFT_THRESH   = 60
 
 def main():
     cfg = load_config()
     setup_logging(cfg.get("log_level", "INFO"))
 
     logging.info("=" * 55)
-    logging.info("  SRNE Invertor Modbus v1.3.0")
+    logging.info("  SRNE Invertor Modbus v1.3.1")
     logging.info(f"  Log: {LOG_FILE}")
     logging.info(f"  Port: {cfg['serial_port']} | Addr: {cfg['modbus_address']} | Poll: {cfg['poll_interval']}s")
     logging.info(f"  RTC check: zilnic la {RTC_CHECK_HOUR:02d}:{RTC_CHECK_MINUTE:02d}, sync daca drift > {RTC_DRIFT_THRESH}s")
     logging.info("=" * 55)
 
-    mq = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
-                     client_id="srne_invertor_addon")
+    mq = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="srne_invertor_addon")
     mq.username_pw_set(cfg["mqtt_user"], cfg["mqtt_password"])
     connected = False
 
@@ -657,15 +647,13 @@ def main():
     if connected:
         publish_discovery(mq, cfg)
 
-    # Stare interna
-    slow_cache: dict = {}        # cache pentru registri cititi rar
-    last_slow_poll   = 0.0       # timestamp ultima citire slow
-    rtc_synced_date  = None      # data (date) ultimei verificari RTC
+    slow_cache: dict = {}
+    last_slow_poll   = 0.0
+    rtc_synced_date  = None
     errors           = 0
     poll             = int(cfg["poll_interval"])
 
-    # Prima citire slow (model info, output priority, SW versions)
-    logging.info("Citire registri slow (model info, output priority, firmware)...")
+    logging.info("Citire registri slow (model info, Peukert, istoric PV, output priority)...")
     slow_data = read_slow_registers(mb, slow_cache)
     last_slow_poll = time.time()
 
@@ -675,19 +663,16 @@ def main():
         t0  = time.time()
         now = datetime.now()
 
-        # ── RTC check: o data pe zi la 00:05 ──────────────────────────────
         today = now.date()
         if (now.hour == RTC_CHECK_HOUR and now.minute == RTC_CHECK_MINUTE
                 and rtc_synced_date != today):
             rtc_synced_date = today
             mb.check_and_sync_rtc(RTC_DRIFT_THRESH)
 
-        # ── Slow poll: output priority, model info, firmware ──────────────
         if time.time() - last_slow_poll >= SLOW_POLL_INTERVAL:
             slow_data = read_slow_registers(mb, slow_cache)
             last_slow_poll = time.time()
 
-        # ── Fast poll: baterie, PV, AC, energie, fault ────────────────────
         try:
             data = read_all(mb)
 
@@ -695,14 +680,13 @@ def main():
                 errors += 1
                 logging.warning(f"Citire esuata ({errors}/5)")
                 if errors >= 5:
-                    logging.error("5 erori consecutive — reconectare serial...")
+                    logging.error("5 erori consecutive -- reconectare serial...")
                     mb.disconnect()
                     time.sleep(5)
                     mb.connect()
                     errors = 0
             else:
                 errors = 0
-                # Combinam datele fast + slow
                 data.update(slow_data)
                 if connected:
                     publish_state(mq, cfg["mqtt_topic_prefix"], data)
@@ -717,7 +701,7 @@ def main():
                         f"State={data.get('machine_state')}"
                     )
                 else:
-                    logging.warning("MQTT neconectat — date necomunicate")
+                    logging.warning("MQTT neconectat -- date necomunicate")
 
         except Exception as e:
             logging.exception(f"Eroare neasteptata: {e}")
