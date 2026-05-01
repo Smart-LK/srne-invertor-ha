@@ -1,6 +1,6 @@
 name: "SRNE Invertor Modbus"
 description: "Citire/scriere Modbus RTU pentru invertor SRNE HF2450S80H (Easun ISI Max II 3.6kW/24V). Publica date in MQTT cu HA auto-discovery."
-version: "1.0.0"
+version: "1.1.0"
 slug: "srne_invertor"
 init: false
 arch:
