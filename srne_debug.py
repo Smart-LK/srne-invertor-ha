@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-srne_debug.py v1.2 - Diagnosticare SRNE Invertor Modbus RTU
+srne_debug.py v1.3 - Diagnosticare SRNE Invertor Modbus RTU
 ============================================================
 Rulare din terminal SSH pe HA:
   pip install pyserial
-  python3 srne_debug.py /dev/ttyUSB1
+  python3 /config/addons/srne_invertor/srne_debug.py /dev/ttyUSB1
 
-Output salvat automat in /tmp/srne_debug.log
+Output salvat automat in acelasi folder cu scriptul (srne_debug.log)
 
 Exemple:
   python3 srne_debug.py /dev/ttyUSB1              # test complet
@@ -16,12 +16,13 @@ Exemple:
   python3 srne_debug.py /dev/ttyUSB1 --write 0xE208 2300  # scriere registru
   python3 srne_debug.py /dev/ttyUSB1 --raw        # dump hex brut
 
-Protocol Modbus RTU:
-  - Scriptul este MASTER, invertorul (addr=1) este SLAVE
-  - Masterul trimite cerere → slave-ul raspunde
-  - JBD BMS nu vorbeste Modbus, dar injecteaza date asincron pe bus
-  - Receive-ul filtreaza raspunsurile dupa adresa slave (0x01)
-    si verifica CRC — orice alt trafic (ex. BMS 0xFF) e ignorat
+Arhitectura bus RS485:
+  - Pe bus-ul intern: Invertorul = MASTER (intreaba BMS-ul periodic)
+                      BMS JBD   = SLAVE  (raspunde invertorului)
+  - Noi ne conectam ca un al doilea master extern:
+    Scriptul = MASTER extern, Invertorul = SLAVE la adresa 1
+  - Receive-ul filtreaza dupa adresa 0x01 + CRC valid
+    Traficul invertor->BMS (0xFF) este ignorat automat
 
 Autor: Smart-LK / Claude Sonnet, mai 2026
 """
@@ -41,21 +42,20 @@ except ImportError:
     print("Lipsa: pip install pyserial")
     sys.exit(1)
 
-# --- Logger dual: consola + fisier -------------------------------------------
+# --- Logger dual: consola + fisier langa script -------------------------------
 
-LOG_FILE = "/tmp/srne_debug.log"
+# Log in acelasi folder cu scriptul, indiferent de unde e rulat
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "srne_debug.log")
 
 def setup_logger():
     logger = logging.getLogger("srne")
     logger.setLevel(logging.DEBUG)
     fmt = logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S")
 
-    # Handler consola
     ch = logging.StreamHandler(sys.stdout)
     ch.setFormatter(fmt)
     logger.addHandler(ch)
 
-    # Handler fisier
     fh = logging.FileHandler(LOG_FILE, mode="w", encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
@@ -95,19 +95,16 @@ def recv_slave_frame(ser, slave_addr, expected_regs, timeout=3.0):
     """
     Primeste raspuns Modbus RTU de la slave_addr, ignorand orice alt trafic.
 
-    In Modbus RTU:
-    - Masterul (noi) trimite cerere la slave_addr
-    - Slave-ul (invertorul) raspunde cu frame incepand cu slave_addr
-    - Orice alti bytes de pe bus (ex. BMS la 0xFF) sunt ignorati
+    Scanam byte cu byte:
+    - Daca byte != slave_addr → ignorat (poate fi trafic invertor->BMS)
+    - Daca byte == slave_addr → incercam sa construim un frame valid
+    - Validam: FC=0x03, byte_count corect, CRC valid
 
     Raspuns normal FC03:
       [slave_addr][0x03][byte_count][data...][CRC_L][CRC_H]
-      byte_count = expected_regs * 2
 
     Raspuns exception:
       [slave_addr][0x83][exc_code][CRC_L][CRC_H]
-
-    Returneaza (frame_bytes, is_exception) sau (None, False) la timeout.
     """
     buf = bytearray()
     start = time.time()
@@ -122,7 +119,6 @@ def recv_slave_frame(ser, slave_addr, expected_regs, timeout=3.0):
         while i < len(buf):
             b = buf[i]
 
-            # Ignoram orice byte care nu e adresa slave-ului nostru
             if b != slave_addr:
                 ignored_bytes += 1
                 i += 1
@@ -134,18 +130,17 @@ def recv_slave_frame(ser, slave_addr, expected_regs, timeout=3.0):
             if len(rest) >= 3 and rest[1] == 0x03:
                 byte_count = rest[2]
                 if byte_count != expected_regs * 2:
-                    # Byte_count nepotrivit — nu e frame-ul nostru, sarim
                     i += 1
                     continue
                 total = 3 + byte_count + 2
                 if len(rest) < total:
-                    break  # asteptam mai multi bytes
+                    break
                 frame = bytes(rest[:total])
                 crc_recv = struct.unpack("<H", frame[-2:])[0]
                 crc_calc = crc16(frame[:-2])
                 if crc_recv == crc_calc:
                     if ignored_bytes > 0:
-                        p(f"  [bus] ignorat {ignored_bytes} bytes de la alte dispozitive")
+                        p(f"  [bus] ignorat {ignored_bytes}b trafic de la alte dispozitive")
                     return frame, False
                 i += 1
                 continue
@@ -156,6 +151,8 @@ def recv_slave_frame(ser, slave_addr, expected_regs, timeout=3.0):
                 crc_recv = struct.unpack("<H", frame[-2:])[0]
                 crc_calc = crc16(frame[:-2])
                 if crc_recv == crc_calc:
+                    if ignored_bytes > 0:
+                        p(f"  [bus] ignorat {ignored_bytes}b trafic de la alte dispozitive")
                     return frame, True
                 i += 1
                 continue
@@ -163,12 +160,11 @@ def recv_slave_frame(ser, slave_addr, expected_regs, timeout=3.0):
             i += 1
 
     if ignored_bytes > 0:
-        p(f"  [bus] ignorat {ignored_bytes} bytes de la alte dispozitive (timeout)")
+        p(f"  [bus] ignorat {ignored_bytes}b trafic de la alte dispozitive (timeout)")
     return None, False
 
 
 def transact(ser, slave_addr, request, expected_regs, timeout=3.0):
-    """Trimite cerere FC03 si primeste raspuns valid de la slave_addr."""
     ser.reset_input_buffer()
     time.sleep(0.05)
     ser.write(request)
@@ -177,7 +173,7 @@ def transact(ser, slave_addr, request, expected_regs, timeout=3.0):
     frame, is_exc = recv_slave_frame(ser, slave_addr, expected_regs, timeout)
 
     if frame is None:
-        p(f"  RX: timeout - niciun raspuns valid de la addr={slave_addr}")
+        p(f"  RX: timeout - niciun raspuns valid de la addr=0x{slave_addr:02X}")
         return None
 
     p(f"  RX ({len(frame)}b): {frame.hex(' ').upper()}")
@@ -336,9 +332,9 @@ def scan_ports():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="SRNE Modbus RTU Debug Tool v1.2",
+        description="SRNE Modbus RTU Debug Tool v1.3",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
 Exemple:
   python3 srne_debug.py /dev/ttyUSB1
   python3 srne_debug.py /dev/ttyUSB1 --reg 0x0100 15
@@ -346,7 +342,7 @@ Exemple:
   python3 srne_debug.py /dev/ttyUSB1 --write 0xE208 2300
   python3 srne_debug.py --scan
 
-Log complet salvat in /tmp/srne_debug.log
+Log salvat automat langa script (srne_debug.log)
         """
     )
     parser.add_argument("port",   nargs="?", default="/dev/ttyUSB1")
@@ -360,18 +356,19 @@ Log complet salvat in /tmp/srne_debug.log
     args = parser.parse_args()
 
     p("=" * 60)
-    p("  SRNE Invertor - Modbus RTU Debug Tool v1.2")
+    p("  SRNE Invertor - Modbus RTU Debug Tool v1.3")
     p(f"  Log: {LOG_FILE}")
     p(f"  Data: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     p("=" * 60)
-    p("  Protocol: Master=script, Slave=invertor (addr=1)")
-    p("  Receive filtreaza dupa adresa slave + CRC valid")
-    p("  Trafic de la alte dispozitive pe bus este ignorat")
+    p("  Arhitectura bus:")
+    p("    Intern: Invertor(master) <-> BMS(slave) — trafic propriu")
+    p("    Extern: Script(master)   -> Invertor(slave addr=1)")
+    p("    Receive filtreaza dupa addr=0x01 + CRC valid")
 
     scan_ports()
 
     if args.scan and not args.reg and not args.write:
-        p(f"\nLog salvat: {LOG_FILE}")
+        p(f"Log: {LOG_FILE}")
         return
 
     p(f"  Port: {args.port} | Baud: {args.baud} 8N1 | Addr: {args.addr}")
@@ -388,7 +385,6 @@ Log complet salvat in /tmp/srne_debug.log
 
     time.sleep(0.3)
 
-    # --- Citire registru specific ---
     if args.reg:
         reg_start = int(args.reg[0], 0)
         count     = int(args.reg[1])
@@ -401,10 +397,9 @@ Log complet salvat in /tmp/srne_debug.log
             for i, v in enumerate(regs):
                 p(f"  [0x{reg_start+i:04X}]  {v:>6}  0x{v:04X}  {v:016b}b")
         ser.close()
-        p(f"\nLog salvat: {LOG_FILE}")
+        p(f"\nLog: {LOG_FILE}")
         return
 
-    # --- Scriere registru ---
     if args.write:
         reg = int(args.write[0], 0)
         val = int(args.write[1], 0)
@@ -412,10 +407,9 @@ Log complet salvat in /tmp/srne_debug.log
         ok = write_reg(ser, args.addr, reg, val)
         p(f"  Rezultat: {'OK' if ok else 'FAIL'}")
         ser.close()
-        p(f"\nLog salvat: {LOG_FILE}")
+        p(f"\nLog: {LOG_FILE}")
         return
 
-    # --- Test complet ---
     p("=== Test complet =============================================")
     p("")
 
@@ -473,7 +467,7 @@ Log complet salvat in /tmp/srne_debug.log
 
     p("")
     p("=== Test complet finalizat ===================================")
-    p(f"Log salvat: {LOG_FILE}")
+    p(f"Log: {LOG_FILE}")
     ser.close()
 
 if __name__ == "__main__":
