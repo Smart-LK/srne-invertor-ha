@@ -1,6 +1,6 @@
 name: "SRNE Invertor Modbus"
-description: "Citire Modbus RTU pentru invertor SRNE/Easun (HF2450S80H, All-in-one solar charger inverter). Publica date in MQTT cu HA auto-discovery."
-version: "2.0.0"
+description: "Modbus RTU -> MQTT -> Home Assistant pentru invertor SRNE/Easun (confirmat pe HF2450S80H). Auto-discovery HA, write commands, fault records, istoricul 7 zile."
+version: "3.0.0"
 slug: "srne_invertor"
 init: false
 arch:
@@ -21,6 +21,7 @@ options:
   serial_port: "/dev/ttyUSB1"
   modbus_address: 1
   poll_interval: 30
+  slow_poll_interval: 3600
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
   mqtt_user: "mqtt_local"
@@ -32,6 +33,7 @@ schema:
   serial_port: str
   modbus_address: int(1,247)
   poll_interval: int(10,300)
+  slow_poll_interval: int(300,86400)
   mqtt_host: str
   mqtt_port: int(1,65535)
   mqtt_user: str

@@ -1,65 +1,47 @@
 # SRNE/Easun Invertor — Home Assistant Addon
 
-Addon Home Assistant pentru monitorizarea invertorului SRNE HF2450S80H (Easun ISI Max II 3.6kW/24V) via Modbus RTU, cu publicare MQTT și auto-discovery complet în HA.
+Addon Home Assistant pentru monitorizarea si controlul invertorului SRNE via Modbus RTU, MQTT si HA auto-discovery.
+
+**Testat pe:** Easun ISI Max II 3.6kW/24V = SRNE HF2450S80H, firmware APP V6.64 (Jun 2022)  
+**Protocol de referinta:** SRNE MODBUS Energy Storage Inverter v1.96 (Jan 2024)
 
 ---
 
 ## Hardware testat
 
-| Componentă | Detalii |
+| Componenta | Detalii |
 |------------|---------|
 | Invertor | Easun ISI Max II 3.6kW/24V = SRNE HF2450S80H |
-| String PV | 10 panouri în serie (~382V Voc) |
-| Baterie | LiFePO4 24V (JBD BMS 9S3P) |
-| Interfață USB | Port USB-B pe invertor (mufa pătrată cu colțuri tăiate) |
-| Chip serial | CH340 (idVendor=1a86, idProduct=7523) — fără serial number unic |
+| Serial | SR-2211150019-300917 |
+| Firmware | APP V6.64, Boot V2.01, HW V2.00 |
+| String PV | 10 panouri in serie (~382V Voc) |
+| Baterie | LiFePO4 24V 9S3P (JBD BMS) |
+| Interfata USB | Port USB-B (mufa patrata) pe invertor |
+| Chip serial | CH340 (idVendor=1a86) — fara serial number unic |
 
 ---
 
-## Schema de conectare Invertor → HA
+## Schema de conectare
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│              Invertor SRNE HF2450S80H                       │
-│                                                             │
-│   Port USB-B (mufa patrata cu colturi taiate)               │
-│   ┌──────────────────────────────┐                          │
-│   │  CH340 USB-Serial intern     │  ← chip fara serial ID  │
-│   │  prezinta interfata          │                          │
-│   │  Modbus RTU SLAVE (addr=1)  │                          │
-│   └──────────────────────────────┘                          │
-└──────────────────────────────────────────────────────────────┘
-         │
-         │ Cablu USB-B → USB-A (sau USB-B → USB-C cu adaptor)
-         │
-         ▼
-┌──────────────────────────────────────────────────────────────┐
-│   Home Assistant OS (Dell Wyse 5070)                        │
-│   /dev/ttyUSB1  (CH340, fara by-id stabil)                  │
-│                                                             │
-│   ┌─────────────────────────────────────────────────┐       │
-│   │  Addon: SRNE Invertor Modbus                    │       │
-│   │  Master Modbus RTU, 9600 bps 8N1                │       │
-│   │  Poll interval: 30s                             │       │
-│   └─────────────────────┬───────────────────────────┘       │
-│                         │ MQTT                              │
-│   ┌─────────────────────▼───────────────────────────┐       │
-│   │  Broker: core-mosquitto                          │       │
-│   │  Topic prefix: srne/                            │       │
-│   └─────────────────────┬───────────────────────────┘       │
-│                         │                                   │
-│   ┌─────────────────────▼───────────────────────────┐       │
-│   │  Home Assistant                                  │       │
-│   │  Auto-discovery → Entitati + Dashboard           │       │
-│   └─────────────────────────────────────────────────┘       │
-└──────────────────────────────────────────────────────────────┘
+[Invertor SRNE HF2450S80H]
+  Port USB-B -> CH340 intern -> Modbus RTU slave (addr=1)
+        |
+        | Cablu USB-B -> USB-A
+        |
+[Home Assistant OS]
+  /dev/ttyUSB1  (CH340, fara by-id stabil — poate varia la reboot)
+        |
+  [Addon: SRNE Invertor Modbus v3.0.0]
+  Master Modbus RTU, 9600 8N1, poll 30s
+        |
+  [core-mosquitto MQTT broker]
+  Topic prefix: srne/
+        |
+  [Home Assistant entities + Energy Dashboard]
 ```
 
-### Nota despre portul serial
-
-CH340-ul din invertor **nu are serial number unic** — nu apare în `/dev/serial/by-id/` cu un nume identificabil. La fiecare reboot poate lua numărul `ttyUSB0` sau `ttyUSB1` în funcție de ordinea de enumerare USB.
-
-**Soluție practică:** Folosește un port USB fix pe placa HA (de ex. cel mai din stânga), sau configurează udev rules dacă ai mai multe dispozitive CH340.
+**Nota port serial:** CH340-ul din invertor nu are serial number unic si nu apare in `/dev/serial/by-id/` cu un nume stabil. Foloseste un port USB fix pe placa HA sau configureaza udev rules.
 
 ---
 
@@ -68,225 +50,244 @@ CH340-ul din invertor **nu are serial number unic** — nu apare în `/dev/seria
 | Parametru | Valoare |
 |-----------|---------|
 | Tip | Modbus RTU (serial) |
-| Adresă slave | 1 |
+| Adresa slave | 1 |
 | Baud rate | 9600 bps |
-| Format | 8N1 (8 data bits, No parity, 1 stop bit) |
-| Function codes suportate | FC03 (Read), FC06 (Write single), FC16 (Write multiple) |
-| CRC | CRC-16/IBM (Modbus standard), LSB first |
+| Format | 8N1 |
+| FC suportate | FC03 (Read), FC06 (Write single), FC16 (Write multiple) |
+| Max registri/cerere | 32 |
+| CRC | CRC-16/IBM, LSB first |
 
 ---
 
-## Register Map — confirmat pe firmware HF2450S80H
+## Register Map confirmat pe HF2450S80H (scan 2026-05-03)
 
-> **Important:** Registrii sunt dependenți de firmware. Valorile de mai jos sunt confirmate empiric pe acest model. Unii registri din documentul oficial SRNE v3.9 nu există pe firmware-ul invertorului (ex. 0x0113, 0x0121 returnează exception 0x02).
+### P01 — Date DC (fast poll, 0x0100 x 15)
 
-### Bloc 0x0100 — Baterie + String PV
-**Citire:** `01 03 01 00 00 0F [CRC]` (15 registri)
+| Adresa | Descriere | Scala | Nota |
+|--------|-----------|-------|------|
+| 0x0100 | SOC baterie | % | 0-100 |
+| 0x0101 | Tensiune baterie | x0.1 V | |
+| 0x0102 | Curent baterie | signed x0.1 A | neg=incarcare, poz=descarcare |
+| 0x0107 | Tensiune PV1 | x0.1 V | |
+| 0x0108 | Curent PV1 | x0.1 A | |
+| 0x0109 | Putere PV1 | W | |
+| 0x010B | **ChargeState** | enum | 0=Off,1=Quick,2=ConstV,4=Float,6=Li,8=Full |
+| 0x010E | Total chg power | W | |
+| 0x010F+ | PV2 | N/A | exception_0x02 pe HF2450S80H |
 
-| Adresă | Descriere | Scală | Unitate | Note |
-|--------|-----------|-------|---------|------|
-| 0x0100 | SOC baterie | byte low | % | 0-100 |
-| 0x0101 | Tensiune baterie | ÷10 | V | ex. 0x0137=311=31.1V |
-| 0x0102 | Curent baterie | **signed** ÷10 | A | negativ=încărcare, pozitiv=descărcare |
-| 0x0103 | Temperaturi | byte high=ctrl, low=bat | °C | bit7=semn |
-| 0x0104 | Tensiune DC load | ÷10 | V | |
-| 0x0105 | Curent DC load | ÷100 | A | |
-| 0x0106 | Putere DC load | direct | W | |
-| 0x0107 | Tensiune string PV | ÷10 | V | ex. 3828=382.8V (10 panouri serie) |
-| 0x0108 | Curent PV | ÷100 | A | |
-| 0x0109 | Putere PV | direct | W | |
-| 0x010A | Load on/off | 0/1 | — | starea sarcinii |
-| 0x010B | Vbat min azi | ÷10 | V | |
-| 0x010C | Charging step | enum | — | 0=Off,1=Active,2=MPPT,4=Boost,5=Float |
+### P02 — Date AC (fast poll)
 
-### Bloc 0x0204 — Ieșire AC + Temperaturi + RTC
-**Citire:** `01 03 02 04 00 1F [CRC]` (31 registri)
+**0x0210 x 16 — Format v1.96 (confirmat, MachineState precis):**
 
-| Adresă | Descriere | Scală | Unitate | Note |
-|--------|-----------|-------|---------|------|
-| 0x0209 | Machine state | enum | — | 0=Standby,1=NoAnomaly,9=Running |
-| 0x020C | RTC: year/month | byte high=year-2002, low=month | — | |
-| 0x020D | RTC: day/hour | byte high=day, low=hour | — | |
-| 0x020E | RTC: min/sec | byte high=min, low=sec | — | |
-| 0x0210 | Load ratio | direct | % | 0-100 |
-| 0x0212 | Running timer | direct | s | crește cu 1/s de la pornire |
-| 0x0216 | Tensiune AC output | ÷10 | V | ex. 2300=230.0V |
-| 0x0218 | Frecvență AC output | ÷100 | Hz | ex. 4999=49.99Hz |
-| 0x0219 | Curent AC output | ÷10 | A | |
-| 0x021B | Putere activă AC | direct | W | |
-| 0x021C | Putere aparentă AC | direct | VA | |
-| 0x0220 | Temperatură DC side | ÷10 | °C | trafo DC |
-| 0x0221 | Temperatură AC side | ÷10 | °C | trafo AC |
-| 0x0222 | Temperatură trafo | ÷10 | °C | |
+| Adresa | Descriere | Scala |
+|--------|-----------|-------|
+| 0x0210 | **MachineState v1.96** | enum: 5=Inverter operation |
+| 0x0213 | Tensiune retea (grid) | x0.1 V |
+| 0x0215 | Frecventa retea | x0.01 Hz |
+| 0x0216 | Tensiune AC out | x0.1 V |
+| 0x0218 | Frecventa AC out | x0.01 Hz |
+| 0x0219 | Curent AC out | x0.1 A |
+| 0x021B | Putere activa AC | W |
+| 0x021C | Putere aparenta AC | VA |
+| 0x021E | Curent incarcare retea | x0.1 A |
+| 0x021F | Sarcina % | % |
 
-**Machine state:**
+**0x0204 x 31 — Format vechi firmware (singura sursa pentru temperaturi!):**
 
-| Cod | Stare |
-|-----|-------|
-| 0 | Standby |
-| 1 | No anomaly |
-| 2 | SW startup |
-| 3 | Starting |
-| 4 | Running (line/mains mode) |
-| 5 | Running (inverter mode) |
-| 6 | Running (ECO mode) |
-| 7 | Fault |
-| 8 | Shutdown |
-| 9 | Running (inverter) |
+| Adresa | Descriere | Nota |
+|--------|-----------|------|
+| 0x020C-020E | RTC | citire+scriere |
+| 0x0220 | Temp DC side | x0.1 °C |
+| 0x0221 | Temp AC side | x0.1 °C |
+| 0x0222 | Temp trafo | x0.1 °C |
 
-### Bloc 0xF02F — Energie
-**Citire:** `01 03 F0 2F 00 0D [CRC]` (13 registri)
+> **Important:** Registrii 0x0220+ cititi standalone dau `exception_0x02`. Temperaturile sunt accesibile DOAR ca parte a blocului 0x0204 x 31.
 
-| Adresă | Descriere | Scală | Unitate |
-|--------|-----------|-------|---------|
-| 0xF02F | Energie PV azi | ÷10 | kWh |
-| 0xF030 | Consum sarcina azi | ÷10 | kWh |
-| 0xF031 | neidentificat | — | — |
-| 0xF032 | neidentificat | — | — |
-| 0xF038 | Energie PV total cumulativ | ÷10 | kWh |
-| 0xF03A | Consum sarcina total cumulativ | ÷10 | kWh |
+### P09 — Statistici (fast + slow poll)
 
-### E-Registri — Stare și parametri
-**Citire individuală FC03, scriere FC06/FC16**
+| Adresa | Descriere | Scala | Tip |
+|--------|-----------|-------|-----|
+| F02D | Bat chg azi | Ah | measurement |
+| F02E | Bat dischg azi | Ah | measurement |
+| F02F | PV azi | x0.1 kWh | measurement |
+| F030 | Consum azi | x0.1 kWh | measurement |
+| F034-F035 | **Bat chg total** | Ah 32-bit LE | total_increasing |
+| F036-F037 | Bat dischg total | Ah 32-bit LE | total_increasing |
+| F038-F039 | **PV total** | x0.1 kWh 32-bit | total_increasing |
+| F03A-F03B | **Consum total** | x0.1 kWh 32-bit | total_increasing |
+| F000-F006 | PV last 7 days | x0.1 kWh/zi | F000=ieri |
+| F007-F00D | Bat chg last 7 days | Ah/zi | |
+| F00E-F014 | Bat dischg last 7 days | Ah/zi | |
+| F01C-F022 | **Load energy 7 days** | x0.1 kWh/zi | F01C=ieri |
+| F04A | Inv work total | h | total_increasing |
 
-| Adresă | Descriere | Valori confirmate |
-|--------|-----------|-------------------|
-| 0xE004 | Machine state (read-only) | 9=Running inverter |
-| 0xE204 | Fault/alarm | 0=OK |
-| 0xE208 | Tensiune AC setata | ÷10=V, ex. 2300=230V |
-| 0xE209 | Frecventa AC setata | ÷100=Hz, ex. 5000=50Hz |
+### P10 — Fault Records (F800-F9F0)
 
-### Registri care NU există pe HF2450S80H
-Returnează **exception 0x02** (adresă invalidă):
+32 inregistrari x 16 registri. Fiecare record: `[0]=fault_code, [1-3]=time(RTC), [4-15]=data snapshot`.
 
-| Adresă | Descriere (doc SRNE) | Status |
-|--------|---------------------|--------|
-| 0x0113 | Energie PV azi (Wh) | N/A — folosește 0xF02F |
-| 0x0114 | Consum azi (Wh) | N/A — folosește 0xF030 |
-| 0x0121 | Fault word (32 bit high) | N/A — folosește 0xE204 |
-| 0x0122 | Fault word (32 bit low) | N/A — folosește 0xE204 |
+Faulturi gasite pe hw: 4 active (Bat undertemp, Bat overvoltage x2, Load short)
+
+### P03 — Device Control (DF00-DF0D, confirmat accesibil)
+
+| Adresa | Comanda |
+|--------|---------|
+| DF00 | Power on(1)/off(0) |
+| DF02 | Clear stats(0xBB), Clear fault history(0xCC) |
+| DF0D | Immediate equalize charge(1) |
+
+### P05 Battery Settings (E000-E01E, E01F+ -> exception)
+### P07 Inverter Settings (E200-E21B, E21C+ -> exception)
+### P08 Grid Connection (E400+) -> exception (off-grid model)
 
 ---
 
-## Instalare în Home Assistant
+## Instalare in Home Assistant
 
-### 1. Adaugă repository-ul
-Settings → Add-ons → Add-on Store → ⋮ → Repositories → adaugă:
+### 1. Adauga repository-ul
+Settings → Add-ons → Add-on Store → ⋮ → Repositories:
 ```
 https://github.com/Smart-LK/srne-invertor-ha
 ```
 
-### 2. Instalează și configurează
-Refresh → **SRNE Invertor Modbus** → Install → Configuration tab:
+### 2. Configurare
 
-| Câmp | Descriere | Default |
+| Camp | Descriere | Default |
 |------|-----------|---------|
-| `serial_port` | Port serial al invertorului | `/dev/ttyUSB1` |
+| `serial_port` | Port serial invertor | `/dev/ttyUSB1` |
 | `modbus_address` | Adresa Modbus slave | `1` |
-| `poll_interval` | Interval citire (secunde) | `30` |
+| `poll_interval` | Interval citire fast (s) | `30` |
+| `slow_poll_interval` | Interval citire slow (s) | `3600` |
 | `mqtt_host` | Broker MQTT | `core-mosquitto` |
 | `mqtt_topic_prefix` | Prefix topic MQTT | `srne` |
-| `log_level` | Nivel logare | `INFO` |
+| `log_level` | Nivel log | `INFO` |
 
 ### 3. Identificare port serial
-Din **SSH terminal HA**:
 ```bash
 ls /dev/ttyUSB*
-# CH340 fara serial ID — nu apare in by-id cu nume unic
-# Verifici care e invertorul si care e alt dispozitiv prin deconectare/reconectare
+# CH340 fara serial ID — verifica prin deconectare/reconectare USB
 ```
 
 ---
 
-## Entități publicate în Home Assistant
+## Entitati HA publicate
 
-### Senzori
-| Entitate | Unitate | Descriere |
-|----------|---------|-----------|
-| SOC Baterie | % | State of Charge |
-| Tensiune Baterie | V | Tensiunea pack-ului |
-| Curent Baterie | A | Negativ=încărcare, pozitiv=descărcare |
-| Temp Controller | °C | Temperatura circuitului de control |
-| Temp Baterie | °C | Temperatura bateriei |
-| Tensiune PV | V | Tensiunea stringului PV (ex. 382V=10 panouri) |
-| Curent PV | A | Curentul de la panouri |
-| Putere PV | W | Puterea instantanee PV |
-| Energie PV Azi | kWh | Producție PV zilnică |
-| Energie PV Total | kWh | Producție PV cumulativă |
-| Tensiune AC Out | V | Tensiunea de ieșire AC |
-| Frecvență AC Out | Hz | Frecvența de ieșire AC |
-| Curent AC Out | A | Curentul de ieșire AC |
-| Putere Activă AC | W | Puterea activă livrată |
-| Putere Aparentă AC | VA | Puterea aparentă |
-| Factor Putere | — | cos φ calculat |
-| Sarcina % | % | Procentaj sarcina față de nominal |
-| Consum Sarcina Azi | kWh | Consum zilnic |
-| Consum Sarcina Total | kWh | Consum cumulativ |
-| Temp DC Side | °C | Temperatura latura DC |
-| Temp AC Side | °C | Temperatura latura AC |
-| Temp Trafo | °C | Temperatura transformator |
-| Stare Încărcare | text | Off/MPPT/Boost/Float etc. |
-| Stare Invertor | text | Standby/Running etc. |
-| RTC Invertor | datetime | Ceasul intern al invertorului |
-| Cod Fault | int | 0=OK |
+### Senzori principali
+| Entitate | Unitate | state_class |
+|----------|---------| -----------|
+| SOC Baterie | % | measurement |
+| Tensiune/Curent Baterie | V, A | measurement |
+| Incarcare/Descarcare Bat Azi | Ah | measurement |
+| **Incarcare/Descarcare Bat Total** | Ah | **total_increasing** |
+| Tensiune/Curent/Putere PV | V, A, W | measurement |
+| **Energie PV Total** | kWh | **total_increasing** |
+| Energie PV Azi | kWh | measurement |
+| Tensiune/Frecventa/Curent AC Out | V, Hz, A | measurement |
+| Putere Activa/Aparenta AC | W, VA | measurement |
+| **Consum Sarcina Total** | kWh | **total_increasing** |
+| Consum Sarcina Azi | kWh | measurement |
+| Temp DC/AC/Trafo | °C | measurement |
+| Stare Invertor | text | — |
+| Etapa Incarcare | text | — |
+| Prioritate Iesire | text | — |
+| Sursa Incarcare | text | — |
+| Inv Work Total | h | total_increasing |
+| Numar Faulturi | — | — |
+| Ultimul Fault / Timp | text | — |
+| PV/Consum Ieri | kWh | measurement |
+| Firmware APP/Boot | — | — |
+| Serial Number | — | — |
 
 ### Binary sensor
 | Entitate | Descriere |
 |----------|-----------|
-| Fault Activ Invertor | ON dacă există orice fault activ |
+| Fault Activ Invertor | ON daca exista fault activ |
+
+### Butoane (write commands via MQTT)
+| Entitate | Comanda |
+|----------|---------|
+| Prioritate Iesire (set) | number 0-2: solar/line/sbu |
+| Sursa Incarcare (set) | number 0-3: pv/ac/hybrid/pvonly |
+| Sterge Faulturi | button -> DF02=0xCC |
+| Sterge Statistici | button -> DF02=0xBB |
+| Oprire/Pornire Invertor | button -> DF00=0/1 |
+| Incarcare Egalizare | button -> DF0D=1 |
 
 ---
 
-## Diagnosticare — srne_debug.py
+## HA Energy Dashboard
 
-Script de diagnosticare rulabil direct din terminalul SSH pe HA, fără a opri addon-ul.
+Pentru diagrama energetica, adauga:
+- **Solar panels:** `pv_energy_total_kwh` (total_increasing)
+- **Home consumption:** `load_energy_total_kwh` (total_increasing)
+- **Battery charge:** `battery_charge_total_ah` (total_increasing, Ah)
+- **Battery discharge:** `battery_discharge_total_ah` (total_increasing, Ah)
+
+---
+
+## Comenzi MQTT directe
 
 ```bash
-# Copiere script pe HA
-cd /config/addons/srne_invertor
+# Schimba prioritate iesire: 0=solar, 1=line, 2=sbu
+mosquitto_pub -h core-mosquitto -u mqtt_local -P mqtt2026vidra \
+  -t srne/cmd/output_priority -m 0
 
-# Test complet (toate blocurile)
-python3 srne_debug.py /dev/ttyUSB1
+# Sursa incarcare: 0=PV prio, 1=AC prio, 2=hybrid, 3=PV only
+mosquitto_pub -h core-mosquitto -u mqtt_local -P mqtt2026vidra \
+  -t srne/cmd/chg_source -m 3
 
-# Citire registru specific
-python3 srne_debug.py /dev/ttyUSB1 --reg 0x0100 15
-python3 srne_debug.py /dev/ttyUSB1 --reg 0xE004 1
+# Sterge fault history
+mosquitto_pub -h core-mosquitto -u mqtt_local -P mqtt2026vidra \
+  -t srne/cmd/clear_faults -m 1
 
-# Scriere parametru
-python3 srne_debug.py /dev/ttyUSB1 --write 0xE208 2300
-
-# Scanare porturi disponibile
-python3 srne_debug.py --scan
-
-# Dump hex brut
-python3 srne_debug.py /dev/ttyUSB1 --raw
+# Pornire/oprire
+mosquitto_pub -h core-mosquitto -u mqtt_local -P mqtt2026vidra \
+  -t srne/cmd/power_on -m 1
 ```
 
-Log salvat automat în același folder: `srne_debug.log`  
-Accesibil via Samba: `\\192.168.200.250\addons\srne_invertor\srne_debug.log`
+---
+
+## Diagnosticare
+
+```bash
+# Scan complet toti registrii (toate sectiunile P00-P10)
+python3 srne_scan_v2.py /dev/ttyUSB1
+
+# Scan sectiune specifica
+python3 srne_scan_v2.py /dev/ttyUSB1 --area p09  # statistici
+python3 srne_scan_v2.py /dev/ttyUSB1 --area p10  # fault records
+python3 srne_scan_v2.py /dev/ttyUSB1 --area p05  # setari baterie
+
+# Debug interactiv
+python3 srne_debug.py /dev/ttyUSB1 --reg 0x0100 15
+```
+
+Log-uri accesibile via Samba: `\\<HA_IP>\addons\srne_invertor\`
 
 ---
 
 ## Changelog
 
-### addon v1.0.0 / srne_debug.py v1.4 — 2026-05-01
-- Versiune inițială funcțională confirmată pe HF2450S80H
-- Ibat interpretat corect ca signed int16 (negativ=încărcare)
-- Registri confirmați: 0x0100×15, 0x0204×31, 0xF02F×13, 0xE004, 0xE204
-- Eliminat 0x0113 și 0x0121 din polling (nu există pe acest firmware)
-- Vpv confirmat ca tensiune string PV (382V = 10 panouri serie)
-- srne_debug.py: log automat în folder script, filtrare bus după addr=0x01 + CRC
-- srne_debug.py: coloana Dec(s) în --reg pentru vizualizare signed values
+### v3.0.0 — 2026-05-03
+- Scan complet P00-P10, implementare finala bazata 100% pe date confirmate
+- **NEW:** 0x0210 MachineState v1.96 (5=Inverter operation, precis)
+- **NEW:** F01C-F022 load energy 7-day history (confirmat)
+- **NEW:** P10 Fault records citite la startup si 1/zi (32 records, 4 active)
+- **NEW:** Write commands via MQTT (output priority, chg source, power on/off, clear faults/stats, equalize)
+- **NEW:** Senzori: model_code, cpu_build_time, hw_ctrl_version, fault_count, latest_fault
+- **NEW:** Istoricul 7 zile pentru load energy (F01C-F022)
+- **FIX:** Temperaturi accesibile DOAR via 0x0204 x 31 (0x0220+ standalone -> exception)
+- **FIX:** E01F+, E21C+, E400-E437 -> exception pe HF2450S80H, eliminate
+- **FIX:** Valori 0x7FFF filtrate (registri neinitializati pe firmware)
+- **FIX:** MachineState enum corectat per v1.96
+- **FIX:** slow_poll_interval configurabil in config.yaml
 
-### srne_debug.py v1.3 — 2026-05-01
-- Log relativ la folder script (nu /tmp)
+### v2.0.0 — 2026-05-02
+- Rewrite complet bazat pe scan confirmat
+- Registri baterie Ah azi/total (32-bit), work times
+- Product info: serial, firmware, HW versions
 
-### srne_debug.py v1.2 — 2026-05-01
-- Log dual consola + fișier
-- Filtrare receive după adresa slave + CRC
+### v1.x.x — 2026-05-01
+- Versiuni intermediare cu fix-uri iterative
 
-### srne_debug.py v1.1 — 2026-05-01
-- Receive inteligent, citire 0x0100 cu 15 regs (evită exception)
-
-### srne_debug.py v1.0 — 2026-05-01
-- Versiune inițială
+### v1.0.0 — 2026-05-01
+- Versiune initiala
