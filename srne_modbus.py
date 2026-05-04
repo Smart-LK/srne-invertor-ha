@@ -1,45 +1,30 @@
 #!/usr/bin/env python3
 """
-srne_modbus.py v3.0.0 - SRNE Invertor Modbus RTU -> MQTT -> Home Assistant
+srne_modbus.py v3.0.1 - SRNE Invertor Modbus RTU -> MQTT -> Home Assistant
 ===========================================================================
 Dispozitiv testat: Easun ISI Max II 3.6kW/24V = SRNE HF2450S80H
   Serial: SR-2211150019-300917  |  Firmware: APP V6.64 (Jun 2022)
   Boot V2.01  |  HW V2.00  |  ProductType: 4 = All-in-one solar charger
 
 Interfata: Port USB-B (mufa patrata) -> CH340 -> /dev/ttyUSB*
-           CH340 fara serial number unic - port poate varia la reboot
 Protocol:  Modbus RTU, addr=1, FC03 read, FC06/FC16 write, 9600 8N1
-           Max 32 registri per cerere (limita protocol)
 
 ===============================================================================
 REGISTER MAP CONFIRMAT (scan complet 2026-05-03, protocol v1.96)
 ===============================================================================
 
 FAST POLL (poll_interval, default 30s):
-  P01 0x0100 x 15: SOC, Vbat, Ibat(signed x0.1), Vpv1, Ipv1, Ppv1,
-                   PvTotalPwr, ChargeState@0x010B, TotalChgPwr@0x010E
-                   Nota: 0x010F+ (Pv2) -> exception_0x02 pe HF2450S80H
-
-  P02 0x0210 x 16: MachineState(v1.96)@0x0210 = 5=Inverter operation
-                   GridVoltA@0x0213, GridFreq@0x0215, InvVoltA@0x0216,
-                   InvFreq@0x0218, LoadCurrA@0x0219, LoadActivePwr@0x021B,
-                   LoadApparentPwr@0x021C, LineChgCurr@0x021E, LoadRatio@0x021F
-                   Nota: 0x0220+ standalone -> exception! Temps doar via 0x0204
-
-  P02 0x0204 x 31: Include RTC@020C-020E + Temp DC/AC/Trafo @0x0220-0x0222
-                   SINGURA modalitate de citire temperaturi pe acest firmware!
-
-  P02 0x0204 x 4:  CurrFaultCode (0=OK)
-
-  P09 0xF02C x 8:  BatChgToday@F02D(Ah), BatDchgToday@F02E(Ah),
-                   PvToday@F02F(kWh x0.1), LoadToday@F030(kWh x0.1)
-  P09 0xF034 x 8:  BatChgTotal@F034-F035(Ah,32-bit LE) <- 17641 Ah confirmat
-                   BatDchgTotal@F036-F037, PvTotal@F038-F039, LoadTotal@F03A-F03B
-  P09 0xF03C x 6:  InvWorkToday@F03E(min)
+  P01 0x0100 x 15: SOC, Vbat, Ibat(signed), Vpv1, Ipv1, Ppv1, ChargeState@010B
+  P02 0x0210 x 16: MachineState(v1.96)=5=Inverter, AC data
+  P02 0x0204 x 31: RTC + Temp DC/AC/Trafo (SINGURUL mod pt temperaturi!)
+  P02 0x0204 x 4:  CurrFaultCode
+  P09 0xF02C x 8:  BatChgToday(Ah), BatDchgToday(Ah), PvToday, LoadToday
+  P09 0xF034 x 8:  BatChgTotal(Ah 32-bit), BatDchgTotal, PvTotal, LoadTotal
+  P09 0xF03C x 6:  InvWorkToday(min)
 
 SLOW POLL (slow_poll_interval, default 3600s):
-  P09 0xF000 x 28: PV/BatChg/BatDchg/GridChg ultim 7 zile (F000-F01B)
-  P09 0xF01C x 11: Load energy 7 zile (F01C-F022) - CONFIRMAT
+  P09 0xF000 x 28: PV/BatChg/BatDchg/GridChg 7 zile
+  P09 0xF01C x 11: Load energy 7 zile (confirmat)
   P09 0xF04A x 2:  InvWorkTotal(h), GridWorkTotal(h)
   P05 0xE000 x 5:  BatModel (type, cap, volt, pv chg max)
   P05 0xE005 x 10: Bat voltage thresholds (OverVolt...DischgLimit)
@@ -49,28 +34,37 @@ SLOW POLL (slow_poll_interval, default 3600s):
   P07 0xE214 x 8:  BMS settings (pana la E21B), E21C+ -> exception!
   P10 0xF800+:     Fault records (32 x 16 regs), citit startup + 1/zi
 
-DEVICE CONTROL (write, confirmat accesibil):
+DEVICE CONTROL (write, confirmat):
   0xDF00: Power on(1)/off(0)
   0xDF02: Clear stats(0xBB), Clear fault history(0xCC)
-  0xDF0D: Immediate equalize charge (1)
+  0xDF0D: Equalize charge (1)
   0x020C-020E: RTC sync
-  0xE204: Set output priority (0=Solar, 1=Line, 2=SBU)
-  0xE20F: Set chg source priority (0=PV prio, 1=AC prio, 2=Hybrid, 3=PV only)
+  0xE204: Output priority (0=Solar, 1=Line, 2=SBU)
+  0xE20F: Chg source priority (0=PV prio, 1=AC prio, 2=Hybrid, 3=PV only)
 
 NOT AVAILABLE pe HF2450S80H:
-  P01 0x010F-0x0111: Pv2 -> exception_0x02
-  P02 0x0220+: Temps standalone -> exception (foloseste 0x0204 block)
-  P05 0xE01F-0xE04D: Timed charge/discharge -> exception_0x02
-  P07 0xE21C-0xE221: Max line current etc -> exception_0x02
-  P08 0xE400-0xE437: Grid connection -> exception (off-grid model)
-
-VALORI DEFAULT 'NESETATE' (filtrate):
-  E215=32767, E216=7, E218=32767 -> registri neinitializati pe HW
+  0x010F-0x0111: Pv2 -> exception_0x02
+  0x0220+ standalone: Temps -> exception (doar via 0x0204 x 31)
+  E01F-E04D: Timed chg/dischg -> exception
+  E21C-E221: -> exception
+  E400-E437: Grid connection -> exception (off-grid model)
 
 ===============================================================================
 HA Energy Dashboard:
-  pv_energy_total_kwh, load_energy_total_kwh (total_increasing)
-  battery_charge_total_ah, battery_discharge_total_ah (total_increasing)
+  pv_energy_total_kwh, load_energy_total_kwh  (total_increasing, device_class=energy)
+  battery_charge_total_kwh, battery_discharge_total_kwh  <- NOU v3.0.1
+    Calculat: Ah * Vref / 1000
+    Vref prioritate:
+      1. media(bat_float_chg_volt_v E009, bat_over_dischg_volt_v E00D)
+         Ex: (31.6V + 27.0V) / 2 = 29.3V pt 9S LiFePO4
+      2. BAT_TYPE_VNOM[bat_type_code]: N celule x Vcell_nominal
+         LiFePO4 x9 = 9 * 3.2V = 28.8V
+      3. bat_nominal_volt_v (E003): sistemul nominal 12/24/48V
+
+  Senzorii Ah (battery_charge_total_ah, battery_discharge_total_ah)
+  NU apar in HA Energy Dashboard (Ah nu este unitate de energie).
+  Sunt pastrati pentru afisarea valorii exacte in Ah.
+  Senzorul diagnostic battery_v_ref_v arata Vref folosita.
 
 MQTT Write Commands (publica la srne/cmd/TOPIC):
   srne/cmd/output_priority -> 0/1/2 (solar/line/sbu)
@@ -78,17 +72,15 @@ MQTT Write Commands (publica la srne/cmd/TOPIC):
   srne/cmd/power_on, power_off, clear_faults, clear_stats, equalize -> 1
 
 Changelog:
+  v3.0.1 - FIX: adaugat battery_charge_total_kwh si battery_discharge_total_kwh
+           (device_class=energy, unit=kWh, state_class=total_increasing)
+           Vref = media(bat_float_chg_volt_v E009, bat_over_dischg_volt_v E00D)
+           Fallback 1: BAT_TYPE_VNOM[bat_type_code] (N celule x V_nominala)
+           Fallback 2: bat_nominal_volt_v (E003 - ultimul resort)
+           Adaugat senzor diagnostic battery_v_ref_v
+           Adaugat BAT_TYPE_VNOM lookup dict
   v3.0.0 - Scan complet 2026-05-03, implementare finala
-           NEW: 0x0210x16 MachineState v1.96 (5=Inverter, confirmat)
-           NEW: F01C-F022 load energy 7-day history (confirmat)
-           NEW: P10 Fault records (32 records, 4 active pe hw)
-           NEW: Write commands via MQTT
-           NEW: model_code, cpu_build_time, hw_ctrl_version in senzori
-           FIX: Temps doar via 0x0204x31 (0x0220+ standalone -> exception)
-           FIX: E01F+, E21C+, E400+ remove (exception)
-           FIX: Filtrare valori 0x7FFF (nesetate pe HW)
-           FIX: MachineState enum per v1.96
-  v2.0.0 - Rewrite complet dupa scan initial 2026-05-02
+  v2.0.0 - Rewrite complet dupa scan 2026-05-02
   v1.0.0 - Initial
 
 Autor: Smart-LK / Claude Sonnet, mai 2026
@@ -142,15 +134,12 @@ def setup_logging(level_str: str):
                               datefmt="%Y-%m-%d %H:%M:%S")
     root  = logging.getLogger()
     root.setLevel(level)
-    for h in root.handlers[:]:
-        root.removeHandler(h)
+    for h in root.handlers[:]: root.removeHandler(h)
     ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(fmt)
-    root.addHandler(ch)
+    ch.setFormatter(fmt); root.addHandler(ch)
     try:
         fh = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
-        fh.setFormatter(fmt)
-        root.addHandler(fh)
+        fh.setFormatter(fmt); root.addHandler(fh)
     except Exception as e:
         logging.warning(f"Nu pot deschide {LOG_FILE}: {e}")
 
@@ -175,8 +164,7 @@ def _fc06(addr, reg, val):
 def _fc16(addr, reg, values):
     n = len(values)
     pdu = struct.pack(">BBHHB", addr, 0x10, reg, n, n*2)
-    for v in values:
-        pdu += struct.pack(">H", v & 0xFFFF)
+    for v in values: pdu += struct.pack(">H", v & 0xFFFF)
     return pdu + struct.pack("<H", _crc16(pdu))
 
 def _s16(v): return v if v < 0x8000 else v - 0x10000
@@ -187,16 +175,14 @@ def _is_unset(v): return v == 0x7FFF
 # --- Receive with slave address filter ----------------------------------------
 
 def _recv_slave_frame(ser, slave_addr: int, expected_regs: int, timeout=3.0):
-    buf = bytearray()
-    start = time.time()
-    ignored = 0
+    """Citeste frame Modbus valid de la slave_addr. Ignora alti slavi de pe bus."""
+    buf = bytearray(); start = time.time(); ignored = 0
     while time.time() - start < timeout:
         c = ser.read(256)
         if c: buf.extend(c)
         i = 0
         while i < len(buf):
-            if buf[i] != slave_addr:
-                ignored += 1; i += 1; continue
+            if buf[i] != slave_addr: ignored += 1; i += 1; continue
             rest = buf[i:]
             if len(rest) >= 3 and rest[1] == 3:
                 bc = rest[2]
@@ -235,9 +221,8 @@ class ModbusRTU:
 
     def read_registers(self, reg: int, cnt: int) -> list | None:
         if cnt > 32: cnt = 32
-        request = _fc03(self.device_addr, reg, cnt)
         self._ser.reset_input_buffer(); time.sleep(0.06)
-        self._ser.write(request)
+        self._ser.write(_fc03(self.device_addr, reg, cnt))
         frame, is_exc = _recv_slave_frame(self._ser, self.device_addr, cnt)
         if frame is None:
             logging.warning(f"Timeout FC03 0x{reg:04X}x{cnt}"); return None
@@ -270,8 +255,7 @@ class ModbusRTU:
     def sync_rtc(self) -> bool:
         inv = self.read_rtc(); now = datetime.now()
         if inv is None:
-            logging.warning("RTC check: nu pot citi")
-            return self._write_rtc(now)
+            logging.warning("RTC check: nu pot citi"); return self._write_rtc(now)
         drift = abs((now-inv).total_seconds())
         logging.info(f"RTC check: inv={inv.strftime('%H:%M:%S')} sys={now.strftime('%H:%M:%S')} drift={drift:.0f}s")
         if drift > 60:
@@ -286,167 +270,256 @@ class ModbusRTU:
 
 # --- Enums --------------------------------------------------------------------
 
-CHARGE_STATE = {0:"Off",1:"Quick charge",2:"Const voltage",4:"Float",6:"Li activate",8:"Full"}
+CHARGE_STATE = {0:"Off", 1:"Quick charge", 2:"Const voltage",
+                4:"Float", 6:"Li activate", 8:"Full"}
 
-MACHINE_STATE_V196 = {  # confirmed at 0x0210 per v1.96
-    0:"Init",1:"Standby",2:"AC power",3:"Inverter",4:"AC power",
-    5:"Inverter operation",6:"Inv->AC",7:"AC->Inv",8:"Bat activate",
-    9:"Manual shutdown",10:"Fault"
+MACHINE_STATE_V196 = {  # la 0x0210, confirmat pe HF2450S80H
+    0:"Init", 1:"Standby", 2:"AC power", 3:"Inverter", 4:"AC power",
+    5:"Inverter operation", 6:"Inv->AC", 7:"AC->Inv",
+    8:"Bat activate", 9:"Manual shutdown", 10:"Fault",
 }
 
 BATTERY_TYPE = {
-    0:"User define",1:"SLD",2:"FLD",3:"GEL",
-    4:"LiFePO4 x14",5:"LiFePO4 x15",6:"LiFePO4 x16",
-    7:"LiFePO4 x7",8:"LiFePO4 x8",9:"LiFePO4 x9",
-    10:"Ternary x7",11:"Ternary x8",12:"Ternary x13",13:"Ternary x14"
+    0:"User define", 1:"SLD", 2:"FLD", 3:"GEL",
+    4:"LiFePO4 x14", 5:"LiFePO4 x15", 6:"LiFePO4 x16",
+    7:"LiFePO4 x7",  8:"LiFePO4 x8",  9:"LiFePO4 x9",
+    10:"Ternary x7", 11:"Ternary x8", 12:"Ternary x13", 13:"Ternary x14",
 }
 
-OUTPUT_PRIORITY = {0:"Solar",1:"Line",2:"SBU"}
-CHG_SOURCE = {0:"PV priority",1:"AC priority",2:"Hybrid",3:"PV only"}
+# Tensiunea nominala a pack-ului (V) per tip baterie.
+# LiFePO4:  3.2 V/celula nominal (punct de repaus ~50% SOC)
+# Ternary:  3.6 V/celula nominal
+# Folosit ca fallback in calculul kWh din Ah, daca registrii de tensiune
+# float/overdischarge nu sunt inca disponibili in slow_cache.
+BAT_TYPE_VNOM = {
+    4:  14 * 3.2,   # LiFePO4 x14 = 44.8V  (sistem 48V)
+    5:  15 * 3.2,   # LiFePO4 x15 = 48.0V  (sistem 48V)
+    6:  16 * 3.2,   # LiFePO4 x16 = 51.2V  (sistem 48V)
+    7:   7 * 3.2,   # LiFePO4 x7  = 22.4V  (sistem 24V)
+    8:   8 * 3.2,   # LiFePO4 x8  = 25.6V  (sistem 24V)
+    9:   9 * 3.2,   # LiFePO4 x9  = 28.8V  (sistem 24V) <- sistemul nostru
+    10:  7 * 3.6,   # Ternary x7  = 25.2V  (sistem 24V)
+    11:  8 * 3.6,   # Ternary x8  = 28.8V  (sistem 24V)
+    12: 13 * 3.6,   # Ternary x13 = 46.8V  (sistem 48V)
+    13: 14 * 3.6,   # Ternary x14 = 50.4V  (sistem 48V)
+}
+
+OUTPUT_PRIORITY = {0:"Solar", 1:"Line", 2:"SBU"}
+CHG_SOURCE = {0:"PV priority", 1:"AC priority", 2:"Hybrid", 3:"PV only"}
 
 FAULT_CODES = {
-    1:"Bat overvoltage",2:"Bat undervoltage",3:"Bat discharge overcurrent",
-    4:"Load short",5:"Bat overtemperature",6:"Bat undertemperature",
-    7:"Inv overvoltage",8:"Inv undervoltage",9:"Inv overcurrent",
-    10:"Bus overvoltage",11:"Bus undervoltage",12:"Inv overload",
-    13:"Fan fault",14:"PV overvoltage",15:"PV overcurrent",16:"Bat reverse",
-    17:"Bat temp sensor",18:"Inv output short",19:"Grid overvoltage",
-    20:"Grid undervoltage",21:"Grid over-freq",22:"Grid under-freq",
-    23:"Output inconsistency",24:"Output imbalance"
+    1:"Bat overvoltage",   2:"Bat undervoltage",
+    3:"Bat discharge overcurrent", 4:"Load short",
+    5:"Bat overtemperature", 6:"Bat undertemperature",
+    7:"Inv overvoltage",   8:"Inv undervoltage",
+    9:"Inv overcurrent",  10:"Bus overvoltage",
+    11:"Bus undervoltage",12:"Inv overload",
+    13:"Fan fault",       14:"PV overvoltage",
+    15:"PV overcurrent",  16:"Bat reverse",
+    17:"Bat temp sensor", 18:"Inv output short",
+    19:"Grid overvoltage",20:"Grid undervoltage",
+    21:"Grid over-freq",  22:"Grid under-freq",
+    23:"Output inconsistency", 24:"Output imbalance",
 }
+
+# --- Battery Vref calculator --------------------------------------------------
+
+def compute_bat_v_ref(data: dict) -> tuple[float, str]:
+    """
+    Calculeaza tensiunea de referinta (Vref) pentru conversia Ah -> kWh.
+
+    Prioritate:
+    1. Media dintre tensiunea de float (E009) si tensiunea de over-discharge (E00D).
+       Reprezinta tensiunea medie reala de operare a pack-ului.
+       Exemplu 9S LiFePO4: (31.6V + 27.0V) / 2 = 29.3V
+
+    2. Tensiunea nominala din tipul bateriei (BAT_TYPE_VNOM):
+       N celule x V_nominala/celula (LiFePO4: 3.2V, Ternary: 3.6V)
+       Exemplu LiFePO4 x9: 9 * 3.2V = 28.8V
+
+    3. bat_nominal_volt_v (E003): selectia sistemului (12/24/48V).
+       Cel mai putin precis, ultimul resort.
+
+    Returneaza (v_ref, sursa) unde sursa e un string descriptiv pentru log.
+    """
+    v_float = data.get('bat_float_chg_volt_v', 0)
+    v_od    = data.get('bat_over_dischg_volt_v', 0)
+    bt      = data.get('bat_type_code', -1)
+    v_nom   = data.get('bat_nominal_volt_v', 24)
+
+    if v_float > 0 and v_od > 0:
+        v_ref = round((v_float + v_od) / 2, 2)
+        src   = f"media float({v_float}V) + OD({v_od}V) = {v_ref}V"
+    elif bt in BAT_TYPE_VNOM:
+        v_ref = round(BAT_TYPE_VNOM[bt], 2)
+        src   = f"tip {BATTERY_TYPE.get(bt, bt)} = {v_ref}V"
+    else:
+        v_ref = float(v_nom)
+        src   = f"E003 nominal = {v_nom}V (fallback)"
+
+    return v_ref, src
 
 # --- Parse functions ----------------------------------------------------------
 
 def parse_p01_dc(regs: list) -> dict:
-    """P01 0x0100 x 15. ChargeState at 0x010B. Max 15 regs!"""
+    """P01 0x0100 x 15. Max 15 regs! ChargeState la 0x010B."""
     def r(a): return regs[a-0x0100] if 0<=a-0x0100<len(regs) else 0
     ibat=_s16(r(0x0102)); cs=r(0x010B)&0xFF
     return {
-        "battery_soc":         r(0x0100)&0xFF,
-        "battery_voltage":     round(r(0x0101)*0.1,1),
-        "battery_current":     round(ibat*0.1,1),
-        "pv_voltage":          round(r(0x0107)*0.1,1),
-        "pv_current":          round(r(0x0108)*0.1,1),
-        "pv_power":            r(0x0109),
-        "pv_total_power":      r(0x010A),
-        "total_charge_power":  r(0x010E),
-        "battery_charge_step": CHARGE_STATE.get(cs,f"?({cs})"),
+        "battery_soc":              r(0x0100)&0xFF,
+        "battery_voltage":          round(r(0x0101)*0.1, 1),
+        "battery_current":          round(ibat*0.1, 1),
+        "pv_voltage":               round(r(0x0107)*0.1, 1),
+        "pv_current":               round(r(0x0108)*0.1, 1),
+        "pv_power":                 r(0x0109),
+        "pv_total_power":           r(0x010A),
+        "total_charge_power":       r(0x010E),
+        "battery_charge_step":      CHARGE_STATE.get(cs, f"?({cs})"),
         "battery_charge_step_code": cs,
     }
 
+
 def parse_p02_ac_v196(regs: list) -> dict:
-    """P02 0x0210 x 16. MachineState v1.96 format. Confirmed."""
+    """P02 0x0210 x 16. MachineState v1.96, confirmat pe HF2450S80H."""
     def r(a): return regs[a-0x0210] if 0<=a-0x0210<len(regs) else 0
     ms=r(0x0210)&0xFF; pac=r(0x021B); pap=r(0x021C)
     return {
-        "machine_state":       MACHINE_STATE_V196.get(ms,f"?({ms})"),
-        "machine_state_code":  ms,
-        "grid_voltage":        round(r(0x0213)*0.1,1),
-        "grid_frequency":      round(r(0x0215)*0.01,2),
-        "ac_output_voltage":   round(r(0x0216)*0.1,1),
-        "ac_output_current":   round(r(0x0219)*0.1,1),
-        "ac_output_frequency": round(r(0x0218)*0.01,2),
-        "ac_active_power":     pac,
-        "ac_apparent_power":   pap,
-        "power_factor":        round(pac/pap,3) if pap else 0.0,
-        "load_ratio":          r(0x021F),
-        "line_chg_current":    round(r(0x021E)*0.1,1),
+        "machine_state":        MACHINE_STATE_V196.get(ms, f"?({ms})"),
+        "machine_state_code":   ms,
+        "grid_voltage":         round(r(0x0213)*0.1, 1),
+        "grid_frequency":       round(r(0x0215)*0.01, 2),
+        "ac_output_voltage":    round(r(0x0216)*0.1, 1),
+        "ac_output_current":    round(r(0x0219)*0.1, 1),
+        "ac_output_frequency":  round(r(0x0218)*0.01, 2),
+        "ac_active_power":      pac,
+        "ac_apparent_power":    pap,
+        "power_factor":         round(pac/pap, 3) if pap else 0.0,
+        "load_ratio":           r(0x021F),
+        "line_chg_current":     round(r(0x021E)*0.1, 1),
     }
 
+
 def parse_p02_old_temps(regs: list) -> dict:
-    """P02 0x0204 x 31. ONLY way to read temps on this firmware."""
+    """P02 0x0204 x 31. SINGURUL mod de citire temperaturi pe HF2450S80H."""
     def r(a): return regs[a-0x0204] if 0<=a-0x0204<len(regs) else 0
     r0,r1,r2=r(0x020C),r(0x020D),r(0x020E)
     try: rtc=f"{(r0>>8)+2002:04d}-{r0&0xFF:02d}-{r1>>8:02d}T{r1&0xFF:02d}:{r2>>8:02d}:{r2&0xFF:02d}"
     except: rtc="invalid"
     return {
-        "rtc_datetime":    rtc,
-        "temp_dc_side":    round(_s16(r(0x0220))*0.1,1),
-        "temp_ac_side":    round(_s16(r(0x0221))*0.1,1),
-        "temp_transformer":round(_s16(r(0x0222))*0.1,1),
+        "rtc_datetime":     rtc,
+        "temp_dc_side":     round(_s16(r(0x0220))*0.1, 1),
+        "temp_ac_side":     round(_s16(r(0x0221))*0.1, 1),
+        "temp_transformer": round(_s16(r(0x0222))*0.1, 1),
     }
+
 
 def parse_f02c(regs: list) -> dict:
     def r(i): return regs[i] if i<len(regs) else 0
     return {
-        "pv_to_grid_today_kwh":       round(r(0)*0.1,1),
+        "pv_to_grid_today_kwh":       round(r(0)*0.1, 1),
         "battery_charge_today_ah":    r(1),
         "battery_discharge_today_ah": r(2),
-        "pv_energy_today_kwh":        round(r(3)*0.1,1),
-        "load_energy_today_kwh":      round(r(4)*0.1,1),
+        "pv_energy_today_kwh":        round(r(3)*0.1, 1),
+        "load_energy_today_kwh":      round(r(4)*0.1, 1),
         "operating_days_total":       r(5),
     }
+
 
 def parse_f034(regs: list) -> dict:
     def r(i): return regs[i] if i<len(regs) else 0
     return {
         "battery_charge_total_ah":    _u32(r(0),r(1)),
         "battery_discharge_total_ah": _u32(r(2),r(3)),
-        "pv_energy_total_kwh":        round(_u32(r(4),r(5))*0.1,1),
-        "load_energy_total_kwh":      round(_u32(r(6),r(7))*0.1,1),
+        "pv_energy_total_kwh":        round(_u32(r(4),r(5))*0.1, 1),
+        "load_energy_total_kwh":      round(_u32(r(6),r(7))*0.1, 1),
     }
+
 
 def parse_f000_history(regs: list) -> dict:
     def r(i): return regs[i] if i<len(regs) else 0
     result={}; labels=["yesterday","2d_ago","3d_ago","4d_ago","5d_ago","6d_ago","7d_ago"]
     for i,lbl in enumerate(labels):
-        result[f"pv_energy_{lbl}_kwh"]=round(r(i)*0.1,1)
-        result[f"bat_chg_{lbl}_ah"]=r(7+i)
-        result[f"bat_dischg_{lbl}_ah"]=r(14+i)
+        result[f"pv_energy_{lbl}_kwh"] = round(r(i)*0.1, 1)
+        result[f"bat_chg_{lbl}_ah"]    = r(7+i)
+        result[f"bat_dischg_{lbl}_ah"] = r(14+i)
     return result
+
 
 def parse_f01c_history(regs: list) -> dict:
     def r(i): return regs[i] if i<len(regs) else 0
     result={}; labels=["yesterday","2d_ago","3d_ago","4d_ago","5d_ago","6d_ago","7d_ago"]
     for i,lbl in enumerate(labels):
-        result[f"load_energy_{lbl}_kwh"]=round(r(i)*0.1,1)
+        result[f"load_energy_{lbl}_kwh"] = round(r(i)*0.1, 1)
     return result
+
 
 def parse_f03c(regs: list) -> dict:
     def r(i): return regs[i] if i<len(regs) else 0
     return {
         "grid_charge_today_ah": r(0),
-        "grid_load_today_kwh":  round(r(1)*0.1,1),
+        "grid_load_today_kwh":  round(r(1)*0.1, 1),
         "inv_work_today_min":   r(2),
         "grid_work_today_min":  r(3),
     }
 
+
 def parse_battery_settings(r1, r2, r3) -> dict:
+    """P05. Praguri in sistem 12V x 0.1, scalate cu (Vnom/12)."""
     result={}
     if r1 and len(r1)>=5:
         bat_v=r1[3]; bt=r1[4]
-        result.update({"bat_pv_chg_max_a":r1[1],"bat_nominal_cap_ah":r1[2],
-            "bat_nominal_volt_v":bat_v,"bat_type_code":bt,
-            "bat_type":BATTERY_TYPE.get(bt,f"?({bt})"),})
+        result.update({
+            "bat_pv_chg_max_a":   r1[1],
+            "bat_nominal_cap_ah": r1[2],
+            "bat_nominal_volt_v": bat_v,
+            "bat_type_code":      bt,
+            "bat_type":           BATTERY_TYPE.get(bt, f"?({bt})"),
+        })
     else: bat_v=24
-    vf=bat_v/12.0 if (r1 and r1[3]>0) else 2.0
+    vf = bat_v/12.0 if (r1 and r1[3]>0) else 2.0
     if r2 and len(r2)>=10:
         vn=["bat_over_volt_v","bat_chg_limit_volt_v","bat_const_chg_volt_v",
-            "bat_improve_chg_volt_v","bat_float_chg_volt_v","bat_improve_chg_back_volt_v",
-            "bat_over_dischg_back_volt_v","bat_under_volt_v","bat_over_dischg_volt_v",
-            "bat_dischg_limit_volt_v"]
-        for i,name in enumerate(vn): result[name]=round(r2[i]*0.1*vf,1)
+            "bat_improve_chg_volt_v","bat_float_chg_volt_v",
+            "bat_improve_chg_back_volt_v","bat_over_dischg_back_volt_v",
+            "bat_under_volt_v","bat_over_dischg_volt_v","bat_dischg_limit_volt_v"]
+        for i,name in enumerate(vn):
+            result[name] = round(r2[i]*0.1*vf, 1)
     if r3 and len(r3)>=4:
-        result.update({"bat_dischg_stop_soc":r3[0],"bat_overdischg_delay_s":r3[1],
-            "bat_const_chg_time_min":r3[2],"bat_improve_chg_time_min":r3[3]})
+        result.update({
+            "bat_dischg_stop_soc":      r3[0],
+            "bat_overdischg_delay_s":   r3[1],
+            "bat_const_chg_time_min":   r3[2],
+            "bat_improve_chg_time_min": r3[3],
+        })
     return result
 
+
 def parse_inverter_settings(ri1, ri2, ri3) -> dict:
+    """P07. Confirmat pana la E21B. E21C+ exception. Filtru 0x7FFF."""
     result={}
     if ri1 and len(ri1)>=10:
         op=ri1[4]
-        result.update({"output_priority_code":op,"output_priority":OUTPUT_PRIORITY.get(op,f"?({op})"),
-            "output_volt_set_v":round(ri1[8]*0.1,1),"output_freq_set_hz":round(ri1[9]*0.01,2)})
+        result.update({
+            "output_priority_code": op,
+            "output_priority":      OUTPUT_PRIORITY.get(op, f"?({op})"),
+            "output_volt_set_v":    round(ri1[8]*0.1, 1),
+            "output_freq_set_hz":   round(ri1[9]*0.01, 2),
+        })
     if ri2 and len(ri2)>=10:
-        max_chg=ri2[0]; cs=ri2[5]
-        result.update({"max_chg_current_a":round(max_chg*0.1,1) if not _is_unset(max_chg) else None,
-            "chg_source_priority_code":cs,"chg_source_priority":CHG_SOURCE.get(cs,f"?({cs})")})
+        mc=ri2[0]; cs=ri2[5]
+        result.update({
+            "max_chg_current_a":        round(mc*0.1,1) if not _is_unset(mc) else None,
+            "chg_source_priority_code": cs,
+            "chg_source_priority":      CHG_SOURCE.get(cs, f"?({cs})"),
+        })
     if ri3 and len(ri3)>=8:
         bms=ri3[7]
         if not _is_unset(bms): result["bms_protocol"]=bms
     return {k:v for k,v in result.items() if v is not None}
 
+
 def read_fault_records(mb: ModbusRTU) -> list:
+    """P10: 32 records x 16 regs (F800-F9F0). Returneaza faulturile active."""
     faults=[]
     for rec in range(32):
         base=0xF800+rec*0x10
@@ -463,13 +536,18 @@ def read_fault_records(mb: ModbusRTU) -> list:
     logging.info(f"Fault records: {len(faults)} active")
     return faults
 
+
 def read_product_info(mb: ModbusRTU) -> dict:
+    """P00: citit o data la startup."""
     info={}
     r=mb.read_registers(0x000A,2)
     if r: info["product_type_code"]=r[1]
     time.sleep(0.1)
     r=mb.read_registers(0x0014,3)
-    if r: info["fw_app_version"]=round(r[0]/100,2); info["fw_boot_version"]=round(r[1]/100,2); info["hw_ctrl_version"]=round(r[2]/100,2)
+    if r:
+        info["fw_app_version"] =round(r[0]/100,2)
+        info["fw_boot_version"]=round(r[1]/100,2)
+        info["hw_ctrl_version"]=round(r[2]/100,2)
     time.sleep(0.1)
     r=mb.read_registers(0x001A,2)
     if r: info["model_code"]=r[1]
@@ -480,7 +558,10 @@ def read_product_info(mb: ModbusRTU) -> dict:
     r=mb.read_registers(0x0035,20)
     if r: info["serial_number"]=_dec_str(r)
     time.sleep(0.1)
-    if info: logging.info(f"Product: SN={info.get('serial_number')} APP=V{info.get('fw_app_version')} Boot=V{info.get('fw_boot_version')}")
+    if info:
+        logging.info(f"Product: SN={info.get('serial_number')} "
+                     f"APP=V{info.get('fw_app_version')} "
+                     f"Boot=V{info.get('fw_boot_version')}")
     return info
 
 # --- Fast poll ----------------------------------------------------------------
@@ -542,7 +623,7 @@ def read_slow(mb: ModbusRTU, cache: dict) -> dict:
 
 # --- MQTT + HA Discovery ------------------------------------------------------
 
-# (key, unit, dc, name, icon, ent_cat, precision, sc_override)
+# (key, unit, device_class, name, icon, entity_category, precision, state_class_override)
 # sc_override: None=auto, "total_increasing", "measurement", ""=no state_class
 SENSORS = [
     # Battery
@@ -551,8 +632,13 @@ SENSORS = [
     ("battery_current","A","current","Curent Baterie","mdi:current-dc",None,1,None),
     ("battery_charge_today_ah","Ah",None,"Incarcare Bat Azi","mdi:battery-arrow-up",None,0,"measurement"),
     ("battery_discharge_today_ah","Ah",None,"Descarcare Bat Azi","mdi:battery-arrow-down",None,0,"measurement"),
+    # Ah total (pastrat pentru valoarea exacta, nu apare in Energy Dashboard)
     ("battery_charge_total_ah","Ah",None,"Incarcare Bat Total","mdi:battery-plus",None,0,"total_increasing"),
     ("battery_discharge_total_ah","Ah",None,"Descarcare Bat Total","mdi:battery-minus",None,0,"total_increasing"),
+    # kWh total (HA Energy Dashboard - device_class=energy, state_class=total_increasing)
+    # Calculat: Ah * Vref / 1000 (Vref = media float+OD > tip baterie > E003 nominal)
+    ("battery_charge_total_kwh","kWh","energy","Incarcare Bat Total kWh","mdi:battery-plus",None,2,"total_increasing"),
+    ("battery_discharge_total_kwh","kWh","energy","Descarcare Bat Total kWh","mdi:battery-minus",None,2,"total_increasing"),
     # PV
     ("pv_voltage","V","voltage","Tensiune PV","mdi:solar-panel",None,1,None),
     ("pv_current","A","current","Curent PV","mdi:solar-panel",None,1,None),
@@ -598,6 +684,8 @@ SENSORS = [
     ("bat_float_chg_volt_v","V","voltage","Tensiune Float","mdi:battery-charging","diagnostic",1,""),
     ("bat_over_dischg_volt_v","V","voltage","Tensiune OverDischg","mdi:battery-alert","diagnostic",1,""),
     ("bat_under_volt_v","V","voltage","Tensiune UnderVolt","mdi:battery-low","diagnostic",1,""),
+    # Vref diagnostic - tensiunea de referinta folosita la calculul kWh
+    ("battery_v_ref_v","V","voltage","Vref Bat (kWh calc)","mdi:calculator","diagnostic",1,""),
     # Faults
     ("fault_count",None,None,"Numar Faulturi","mdi:alert-circle","diagnostic",0,""),
     ("latest_fault_desc",None,None,"Ultimul Fault","mdi:alert","diagnostic",None,""),
@@ -609,11 +697,13 @@ SENSORS = [
     ("bat_dischg_yesterday_ah","Ah",None,"Descarcare Bat Ieri","mdi:battery-arrow-down","diagnostic",0,"measurement"),
 ]
 
+
 def _make_device(pi: dict) -> dict:
     sn=pi.get("serial_number",""); app=pi.get("fw_app_version","?")
     return {"identifiers":[f"srne_{sn}" if sn else "srne_hf2450s80h"],
         "name":"SRNE Invertor","model":"HF2450S80H (Easun ISI Max II 3.6kW/24V)",
         "manufacturer":"SRNE Solar","serial_number":sn,"sw_version":f"APP V{app}"}
+
 
 def publish_discovery(client, cfg: dict, pi: dict):
     prefix=cfg["ha_discovery_prefix"]; state=f"{cfg['mqtt_topic_prefix']}/state"
@@ -639,7 +729,8 @@ def publish_discovery(client, cfg: dict, pi: dict):
         "state_topic":state,"value_template":"{{ 'ON' if value_json.fault_active else 'OFF' }}",
         "device_class":"problem","device":device,"entity_category":"diagnostic"}),retain=True)
 
-    for key,name,vmin,vmax in [("output_priority","Prioritate Iesire (set)",0,2),("chg_source","Sursa Incarcare (set)",0,3)]:
+    for key,name,vmin,vmax in [("output_priority","Prioritate Iesire (set)",0,2),
+                                ("chg_source","Sursa Incarcare (set)",0,3)]:
         client.publish(f"{prefix}/number/srne_{key}_set/config",json.dumps({
             "name":name,"unique_id":f"srne_set_{key}","command_topic":f"{cmd}/{key}",
             "min":vmin,"max":vmax,"step":1,"mode":"box","device":device,
@@ -654,8 +745,10 @@ def publish_discovery(client, cfg: dict, pi: dict):
 
     logging.info("HA auto-discovery publicat.")
 
+
 def publish_state(client, topic_prefix: str, data: dict):
     client.publish(f"{topic_prefix}/state",json.dumps(data,default=str),retain=False)
+
 
 def handle_cmd(mb: ModbusRTU, topic: str, payload: str):
     try: val=int(payload.strip())
@@ -676,11 +769,12 @@ def handle_cmd(mb: ModbusRTU, topic: str, payload: str):
 RTC_CHECK_HOUR=0; RTC_CHECK_MINUTE=5
 FAULT_READ_INTERVAL=86400
 
+
 def main():
     cfg=load_config(); setup_logging(cfg.get("log_level","INFO"))
     slow=cfg.get("slow_poll_interval",DEFAULTS["slow_poll_interval"])
     logging.info("="*58)
-    logging.info("  SRNE Invertor Modbus v3.0.0")
+    logging.info("  SRNE Invertor Modbus v3.0.1")
     logging.info(f"  Log: {LOG_FILE}")
     logging.info(f"  Port: {cfg['serial_port']} | Poll: {cfg['poll_interval']}s | Slow: {slow}s")
     logging.info("="*58)
@@ -721,6 +815,7 @@ def main():
     logging.info("Citire slow registers (initial)...")
     slow_data=read_slow(mb,slow_cache); slow_data.update(product_info); last_slow=time.time()
     rtc_synced_date=None; errors=0; poll=int(cfg["poll_interval"]); slow_i=int(slow)
+    bat_v_ref_logged=False
     logging.info(f"Polling: fast={poll}s slow={slow_i}s")
 
     while True:
@@ -732,6 +827,7 @@ def main():
             slow_data=read_slow(mb,slow_cache); slow_data.update(product_info); last_slow=t0
         if t0-last_fault_read>=FAULT_READ_INTERVAL:
             fault_records=read_fault_records(mb); last_fault_read=t0
+
         try:
             data=read_fast(mb)
             if data is None:
@@ -740,26 +836,52 @@ def main():
                     logging.error("5 erori -> reconectare..."); mb.disconnect(); time.sleep(5); mb.connect(); errors=0
             else:
                 errors=0; data.update(slow_data)
+
+                # --- Battery kWh = Ah * Vref / 1000 -------------------------
+                # Vref: 1) media(float,OD) 2) tip baterie 3) E003 nominal
+                bat_v_ref, bat_v_src = compute_bat_v_ref(data)
+                data["battery_v_ref_v"]             = bat_v_ref
+                data["battery_charge_total_kwh"]    = round(data.get("battery_charge_total_ah",0)    * bat_v_ref / 1000, 2)
+                data["battery_discharge_total_kwh"] = round(data.get("battery_discharge_total_ah",0) * bat_v_ref / 1000, 2)
+                if not bat_v_ref_logged:
+                    logging.info(f"Battery kWh Vref: {bat_v_src}")
+                    logging.info(f"  ChgTotal={data['battery_charge_total_kwh']}kWh "
+                                 f"DchgTotal={data['battery_discharge_total_kwh']}kWh")
+                    bat_v_ref_logged=True
+
+                # --- Fault info ----------------------------------------------
                 data["fault_count"]=len(fault_records)
                 if fault_records:
                     latest=fault_records[-1]
                     data["latest_fault_desc"]=latest["desc"]; data["latest_fault_time"]=latest["time"]
                 else:
                     data["latest_fault_desc"]="None"; data["latest_fault_time"]="None"
-                data["pv_energy_yesterday_kwh"]=data.get("pv_energy_yesterday_kwh",0)
+
+                # --- 7-day aliases -------------------------------------------
+                data["pv_energy_yesterday_kwh"]  =data.get("pv_energy_yesterday_kwh",0)
                 data["load_energy_yesterday_kwh"]=data.get("load_energy_yesterday_kwh",0)
-                data["bat_chg_yesterday_ah"]=data.get("bat_chg_yesterday_ah",0)
-                data["bat_dischg_yesterday_ah"]=data.get("bat_dischg_yesterday_ah",0)
+                data["bat_chg_yesterday_ah"]     =data.get("bat_chg_yesterday_ah",0)
+                data["bat_dischg_yesterday_ah"]  =data.get("bat_dischg_yesterday_ah",0)
+
                 if connected:
                     publish_state(mq,cfg["mqtt_topic_prefix"],data)
-                    logging.info(f"SOC={data.get('battery_soc')}% Vbat={data.get('battery_voltage')}V "
-                        f"Ibat={data.get('battery_current')}A Ppv={data.get('pv_power')}W "
-                        f"Pac={data.get('ac_active_power')}W Tdc={data.get('temp_dc_side')}C "
-                        f"State={data.get('machine_state')} BatAzi={data.get('battery_charge_today_ah')}Ah "
-                        f"BatTot={data.get('battery_charge_total_ah')}Ah")
+                    logging.info(
+                        f"SOC={data.get('battery_soc')}% "
+                        f"Vbat={data.get('battery_voltage')}V "
+                        f"Ibat={data.get('battery_current')}A "
+                        f"Ppv={data.get('pv_power')}W "
+                        f"Pac={data.get('ac_active_power')}W "
+                        f"Tdc={data.get('temp_dc_side')}C "
+                        f"State={data.get('machine_state')} "
+                        f"BatAzi={data.get('battery_charge_today_ah')}Ah "
+                        f"BatTot={data.get('battery_charge_total_ah')}Ah "
+                        f"({data.get('battery_charge_total_kwh')}kWh Vref={bat_v_ref}V)"
+                    )
                 else: logging.warning("MQTT neconectat")
+
         except Exception as e: logging.exception(f"Eroare: {e}"); errors+=1
         time.sleep(max(0,poll-(time.time()-t0)))
+
 
 if __name__=="__main__":
     try: main()

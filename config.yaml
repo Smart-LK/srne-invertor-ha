@@ -1,6 +1,6 @@
 name: "SRNE Invertor Modbus"
 description: "Modbus RTU -> MQTT -> Home Assistant pentru invertor SRNE/Easun (confirmat pe HF2450S80H). Auto-discovery HA, write commands, fault records, istoricul 7 zile."
-version: "3.0.0"
+version: "3.0.1"
 slug: "srne_invertor"
 init: false
 arch:
